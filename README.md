@@ -311,7 +311,7 @@ A migration utility `surgery.py` remaps saved synapse indices after the neuron l
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos={mellson}/mindai&type=Date)](https://star-history.com/#{username}/mindai&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=mellson19/mindai&type=Date)](https://star-history.com/#{username}/mindai&Date)
 
 ---
 
