@@ -9,7 +9,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-GPU%20Accelerated-EE4C2C?style=flat-square&logo=pytorch)](https://pytorch.org)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPL%203.0-green?style=flat-square)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Active%20Research-orange?style=flat-square)]()
 [![Neuroscience](https://img.shields.io/badge/Grounded%20In-Neuroscience-purple?style=flat-square)]()
 
