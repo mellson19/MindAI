@@ -1,0 +1,35 @@
+# config/default_sim.yaml
+
+hardware:
+  backend: "cpu_numpy"
+  num_nodes: 9370            
+  spatial_dimensions: 3
+  brain_radius_mm: 50.0
+
+biology:
+  base_energy: 3000.0
+  spike_cost_mj: 0.01
+  inhibitory_ratio: 0.2
+  axonal_conduction_velocity: 2.0
+
+consciousness:
+  global_workspace_threshold: 0.75
+  volition_delay_ticks: 15
+  temporal_window_size: 7
+
+plasticity:
+  enable_structural_growth: true
+  synaptogenesis_prob: 0.015
+  pruning_half_life: 300
+  hebbian_ltp_rate: 0.08
+
+lifecycle:
+  circadian_cycle_ticks: 5000
+  rem_sleep_duration: 500
+
+ENV_CONFIG:
+  use_2d_world: True
+  world_type: "advanced" #easy / advanced
+  world_size: 40
+  food_count: 3
+  poison_count: 2
