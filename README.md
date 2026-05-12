@@ -2,295 +2,438 @@
 
 # MindAI
 
-### A biologically grounded simulation of emergent machine consciousness
+### A biologically grounded computational model of an embodied nervous system
 
-*No gradient descent. No reward functions. No scripted behaviors.*  
-*Only neurons, chemistry, and time.*
+*No gradient descent. No loss functions. No scripted behavior.*
+*Synapses, neuromodulators, and time.*
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-GPU%20Accelerated-EE4C2C?style=flat-square&logo=pytorch)](https://pytorch.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-GPU%20(grad%20disabled)-EE4C2C?style=flat-square&logo=pytorch)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-GPL%203.0-green?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active%20Research-orange?style=flat-square)]()
-[![Neuroscience](https://img.shields.io/badge/Grounded%20In-Neuroscience-purple?style=flat-square)]()
+[![Status](https://img.shields.io/badge/Status-Active%20research-orange?style=flat-square)]()
 
 </div>
 
 ---
 
-## Overview
+## What this project is
 
-MindAI is a real-time neural simulation where a synthetic agent survives in a 2D world through **emergent behavior only** — no trained weights, no objectives, no designer-specified goals. The agent's brain is a sparse spiking network of ~9,000 neurons that self-organizes through biologically accurate Hebbian/STDP plasticity, modulated by a full neuroendocrine system.
+MindAI is a real-time simulation of an embodied nervous system written from a single
+constraint: **every learning event, every behavior, and every internal state must
+correspond to an identifiable mechanism in the mammalian brain**, backed by
+peer-reviewed neuroscience.
 
-The project is built around four major scientific theories of consciousness, each implemented as a discrete computational module:
+It is not a deep learning model. `torch.set_grad_enabled(False)` is set at startup.
+There is no optimizer, no backpropagation, no loss function, and no global error
+signal anywhere in the codebase. Plasticity is local and Hebbian: synapses change
+because the neurons they connect fired in close temporal proximity (Hebb 1949;
+Bi & Poo 1998). Neuromodulators *gate* how much plasticity occurs, never *which
+direction* to update — there is no teacher.
 
-| Theory | Author(s) | Module |
-|--------|-----------|--------|
-| **Global Workspace Theory** | Baars (1988), Dehaene (2001) | `global_workspace.py` |
-| **Integrated Information Theory** (Φ) | Tononi (2004) | `qualia_space_iit.py` |
-| **Predictive Processing / Free Energy** | Friston (2010) | `predictive_hierarchy.py` |
-| **Somatic Marker Hypothesis** | Damasio (1994) | `volition_and_agency.py` |
+The system is built around a recurrent sparse spiking network of 400 000 to
+1 500 000 neurons running on a single GPU. On top of that substrate, ~30 modules
+implement specific anatomical structures of the human brain (PFC, amygdala,
+hippocampal subfields DG/CA3/CA1, cerebellum, basal ganglia, periaqueductal gray,
+locus coeruleus, etc.). Each module is documented against a specific paper or
+finding it implements.
 
-The system has no access to ground truth. It has no loss function. Behavior emerges from the interaction of physiology, memory, and a world that doesn't care if it survives.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    World (40×40 grid)                   │
-│         food · poison · walls · human agent             │
-└───────────────────┬─────────────────────────────────────┘
-                    │ raw pixels + spatial audio
-          ┌─────────▼──────────┐
-          │  Retina + Cochlea  │  vision (foveal encoding)
-          │                    │  hearing (32 cochlear bands)
-          └─────────┬──────────┘
-                    │ raw_sensory  [N-dim]
-          ┌─────────▼──────────────────────────────┐
-          │     Sparse Connectome  (GPU)            │
-          │  ~9 370 neurons · Hebbian/STDP weights  │
-          │  80% excitatory (glutamate)             │
-          │  20% inhibitory (GABA)                  │
-          └─────────┬──────────────────────────────┘
-                    │ internal recurrence
-          ┌─────────▼──────────┐
-          │ PredictiveMicro-   │  top-down: L5/6 prediction neurons
-          │ circuits           │  bottom-up: L2/3 error neurons
-          └─────────┬──────────┘
-                    │ updated state + surprise scalar
-          ┌─────────▼──────────┐
-          │  HusserlianTime    │  "thick present"
-          │                    │  retention · now · protention
-          └─────────┬──────────┘
-                    │
-          ┌─────────▼──────────┐
-          │     Thalamus       │  attention gate
-          │                    │  threshold ∝ noradrenaline / boredom
-          └─────────┬──────────┘
-                    │ salient signal
-          ┌─────────▼──────────────────────────────┐
-          │  PhaseCoupledWorkspace  (Kuramoto)      │
-          │  R > 0.7  →  global ignition broadcast  │
-          └────┬──────────────────────────┬─────────┘
-               │ broadcast activity       │ snapshot → Hippocampus
-    ┌──────────▼─────────┐    ┌───────────▼──────────────┐
-    │  EndocrineSystem   │    │  Hippocampus             │
-    │  dopamine          │    │  episodic encoding       │
-    │  serotonin (vagus) │    │  valence-gated storage   │
-    │  noradrenaline     │    │  sleep replay ×5 speed   │
-    │  cortisol (HPA)    │    └──────────────────────────┘
-    │  oxytocin (social) │
-    │  endorphins        │
-    └──────────┬─────────┘
-               │ neuromodulator state
-    ┌──────────▼──────────────────────────────────────────┐
-    │  BasalGanglia  →  FreeWillEngine                    │
-    │  corticostriatal mapping    Libet delay (15 ticks)  │
-    │  dopamine/pain reinforce    somatic veto            │
-    └──────────┬──────────────────────────────────────────┘
-               │ action (0–4)
-    ┌──────────▼─────────┐
-    │   World.execute()  │  move · eat · drink
-    │                    │  energy / water / stress Δ
-    └──────────┬─────────┘
-               │
-    ┌──────────▼─────────────────────────────────────────┐
-    │  StructuralPlasticity  (STDP + synaptogenesis)      │
-    │  LTP / LTD  ·  pruning  ·  homeostatic scaling     │
-    │  cortisol neurotoxicity  ·  neurogenesis on demand  │
-    └────────────────────────────────────────────────────┘
-```
-
-### Sleep path
-
-When adenosine + melatonin pressure crosses threshold, the main loop is bypassed entirely. The `SleepCycle` replays hippocampal episodes through `StructuralPlasticity` at 5× rate. High cortisol during sleep stochastically corrupts memories — a model of trauma-influenced consolidation.
+The current primary target — `main_agent.py` — uses this substrate as a
+**multimodal language analog**: text, images with captions, video with audio, and
+Q&A pairs are presented to the agent and learned through Hebbian binding between
+sensory channels. Memory lives in synaptic weights, not in a context window;
+conversation and training are the same loop.
 
 ---
 
-## Biological mechanisms
+## Position relative to other work
 
-### Synaptic plasticity — Hebbian/STDP
-Weights change exclusively through spike-timing-dependent plasticity (Bi & Poo, 1998). Pre-before-post firing causes LTP; post-before-pre causes LTD. No global error signal exists. The only modulation is through neuromodulators that gate *how much* synapses change, never *in which direction* to change them.
+This project sits in computational neuroscience and neuromorphic computing, not in
+the transformer / statistical-ML tradition.
+
+|                              | Transformer / LLM                                       | MindAI                                                        |
+| ---------------------------- | ------------------------------------------------------- | ------------------------------------------------------------- |
+| Learning rule                | Backpropagation through a differentiable computation graph | Spike-Timing-Dependent Plasticity, local at each synapse      |
+| Objective                    | Minimize a loss on a dataset                            | None. Behavior emerges from physiology under sensory pressure |
+| Context window               | Fixed-length attention window                           | None. Context lives in synaptic weights, integrated over the agent's lifetime |
+| Computation graph            | Layered (embed → attention → MLP × N)                   | Recurrent sparse matrix over anatomical regions               |
+| Training vs. inference       | Separate phases                                         | Same loop. Synapses change on every tick, including during chat |
+| Time                         | Discrete positional encoding                            | Continuous: axonal delays, refractory periods, theta/gamma windows |
+
+Within computational neuroscience, the closest relatives are Nengo / Spaun
+(Eliasmith et al.), Blue Brain (Markram), Numenta HTM (Hawkins), and the spiking
+networks targeted by Intel Loihi and SpiNNaker. The contribution of MindAI is not
+the underlying paradigm — SNN + STDP is decades old — but the **scope of integration**:
+most published SNN models examine a single mechanism in isolation
+(e.g. STDP in primary visual cortex, or dopaminergic action selection in the
+basal ganglia). MindAI integrates ~30 such mechanisms in a single running
+process, sharing one synaptic substrate, on a clock.
+
+---
+
+## Architectural overview
 
 ```
-ΔW_LTP  ∝  pre_trace(t) × post_active(t) × neuromod_multiplier
-ΔW_LTD  ∝  pre_active(t) × post_trace(t) × neuromod_multiplier
+┌────────────────────────────────────────────────────────────────┐
+│  World — multimodal sensory stream (AgentWorld) or GridWorld   │
+│  text · images+captions · video+audio · Q&A · interactive chat │
+└────────────┬───────────────────────────────────────────────────┘
+             │
+   ┌─────────▼──────────────┐
+   │  FovealRetina          │  non-uniform foveal sampling (Curcio 1990)
+   │  Cochlea               │  ERB-spaced basilar membrane (Glasberg & Moore 1990)
+   │  Token channel         │  tiktoken cl100k_base (8192-vocab cap)
+   └─────────┬──────────────┘
+             │ packed sensory vector
+   ┌─────────▼─────────────────────────────────────────────────┐
+   │  Sparse recurrent connectome   400k–1.5M neurons, GPU    │
+   │  80% glutamatergic · 20% GABAergic (Dale's principle)    │
+   │  Synapse density 2×10⁻⁴ · STDP weights · axonal delays   │
+   └─────────┬─────────────────────────────────────────────────┘
+             │ recurrent dynamics + delayed PSPs
+   ┌─────────▼──────────────┐
+   │  PredictiveMicro-      │  L5/6 prediction · L2/3 error
+   │  circuits              │  (Rao & Ballard 1999)
+   └─────────┬──────────────┘
+             │ surprise scalar
+   ┌─────────▼──────────────┐
+   │  HusserlianTime        │  retention · primal impression · protention
+   │                        │  (theta-gamma temporal binding, Lisman & Jensen 2013)
+   └─────────┬──────────────┘
+             │
+   ┌─────────▼──────────────┐
+   │  Thalamus              │  attention gate (NA-driven), (Crick 1984)
+   └─────────┬──────────────┘
+             │ salient signal
+   ┌─────────▼──────────────────────────────┐
+   │  Phase-Coupled Workspace (Kuramoto)    │  ignition when R > 0.7
+   │                                        │  (Baars 1988; Dehaene 2001)
+   └────┬───────────────────────────┬───────┘
+        │ broadcast                 │ snapshot
+        │                  ┌────────▼────────────────┐
+        │                  │ Hippocampus DG/CA3/CA1  │  pattern separation +
+        │                  │                         │  completion (Marr 1971;
+        │                  │                         │  Treves & Rolls 1994)
+        │                  └─────────────────────────┘
+   ┌────▼───────────────────────────────────────────────────────┐
+   │  EndocrineSystem — 15 neuromodulators                      │
+   │  3 dopamine pathways (mesolimbic, mesocortical,            │
+   │  nigrostriatal) · 5-HT · NA · cortisol · oxytocin ·        │
+   │  endorphins · adrenaline · ACh · anandamide ·              │
+   │  substance P · ghrelin · leptin · vasopressin ·            │
+   │  prolactin · insulin                                       │
+   └────┬───────────────────────────────────────────────────────┘
+        │ chemical state
+   ┌────▼──────────────────────────────────────────────────────┐
+   │  Action selection                                          │
+   │  BasalGanglia (D1 direct · D2 indirect · STN hyperdirect) │
+   │    Δw = η · pre · post · (DA − baseline)  (Reynolds 2002) │
+   │  ACC conflict monitor → STN brake (Botvinick 2001)        │
+   │  Cerebellum forward model + climbing-fibre LTD (Ito 1984) │
+   │  FreeWillEngine — Libet delay + somatic veto (Libet 1983) │
+   └────┬──────────────────────────────────────────────────────┘
+        │ motor pattern
+   ┌────▼───────────────────────┐
+   │  SuperiorColliculus        │  retinotopic saccade map →
+   │                            │  emergent gaze (no scripts)
+   └────┬───────────────────────┘
+        │
+   ┌────▼──────────────────────────────────────────────────────┐
+   │  Plasticity — STDP gated by DA / cortisol / ACh           │
+   │  Astrocytes (Volterra 2005) · structural plasticity ·     │
+   │  neurogenesis on surprise · Turrigiano homeostatic scaling│
+   └───────────────────────────────────────────────────────────┘
 ```
 
-Synaptic homeostasis (Turrigiano scaling) normalizes total incoming weight when neurons become overloaded.
+Sleep is a separate pathway: when adenosine and melatonin cross threshold
+(Borbély 1982), the main loop is bypassed and the `SleepCycle` replays
+hippocampal episodes through structural plasticity at 5× rate. High cortisol
+during sleep stochastically corrupts replayed memories — a model of
+trauma-influenced consolidation (Diekelmann & Born 2010).
 
-### Neuroendocrine system
-Seven neuromodulators interact continuously:
+---
 
-| Molecule | Biological source | Role in simulation |
-|----------|------------------|--------------------|
-| **Dopamine** | VTA / striatum | Pavlovian conditioning; gates plasticity multiplier |
-| **Serotonin** | Raphe / gut | Vagal tone from satiation; mood baseline |
-| **Noradrenaline** | Locus coeruleus | Thalamic gain; arousal; surprise-driven |
-| **Cortisol** | HPA axis | Suppresses LTP; damages synapses at sustained high levels |
-| **Oxytocin** | Hypothalamus | Social bonding (E key); dampens fear; reduces cortisol |
-| **Endorphins** | Arcuate nucleus | Analgesic; burst-released on reward; boosts plasticity |
-| **Adrenaline** | Adrenal medulla | Fight-or-flight; co-triggered with noradrenaline + pain |
+## Selected mechanisms
 
-Plasticity multiplier: `(dopamine × 1.5 + serotonin × 0.5) × (1 − cortisol) × (1 + endorphins)`
+### Synaptic plasticity — local Hebbian/STDP
+Weights change exclusively through spike-timing-dependent plasticity
+(Bi & Poo 1998). No global error signal exists. Neuromodulators multiply the
+magnitude of change; they cannot reverse its direction.
 
-Pain suppresses plasticity continuously: `multiplier × max(0, 1 − pain/100)` — it never reverses learning direction.
+```
+ΔW_LTP  ∝  pre_trace(t) · post_active(t) · m(chemistry)
+ΔW_LTD  ∝  pre_active(t) · post_trace(t) · m(chemistry)
 
-### Global Workspace — Kuramoto ignition
-Phase coupling is computed across all active neurons via the Kuramoto order parameter R. When synchrony exceeds R = 0.7, a nonlinear "ignition" event occurs: activity is amplified ×3 and broadcast globally, with a 30-tick refractory period. This models the all-or-nothing conscious access reported by Dehaene & Changeux (2011).
+m(chemistry) = (DA · 1.5 + 5HT · 0.5) · (1 − cortisol) · (1 + endorphins)
+```
+
+Turrigiano homeostatic scaling normalizes total incoming weight when neurons
+become overloaded (Turrigiano 2008).
+
+### Three-factor corticostriatal learning
+Action selection follows the canonical three-factor rule:
+
+```
+Δw = η · pre · post · (DA − baseline)
+```
+
+D1 (direct) and D2 (indirect) pathways use mirrored update rules so that
+above- and below-baseline dopamine drive approach and avoidance respectively
+(Reynolds & Wickens 2002). The subthalamic hyperdirect pathway provides a fast
+brake gated by anterior cingulate conflict monitoring (Botvinick et al. 2001).
 
 ### Predictive hierarchy
-Two anatomically distinct neuron populations are maintained:
+Two anatomically distinct neuron populations:
 
-- **Prediction neurons** (L5/6 analogue): `Ŷ = W_td × internal_state` — top-down expectation
-- **Error neurons** (L2/3 analogue): `ε = relu(sensory − Ŷ)` — bottom-up mismatch signal
+- Prediction neurons (L5/6 analogue): `Ŷ = W_td · internal_state`
+- Error neurons (L2/3 analogue): `ε = relu(sensory − Ŷ)`
 
-Both populations are persistent across ticks, enabling other modules to read the current prediction or surprise state independently.
+Both populations are persistent across ticks, so other modules can read the
+current prediction state or surprise signal independently. Surprise drives
+acetylcholine release, which sharpens STDP precision and triggers neurogenesis
+(Rao & Ballard 1999; Kilgard & Merzenich 1998).
+
+### Global Workspace — Kuramoto ignition
+Phase coupling is computed across active neurons via the Kuramoto order
+parameter R. When R exceeds 0.7, a nonlinear ignition event amplifies activity
+×3 and broadcasts it globally, with a 30-tick refractory period — the
+all-or-nothing conscious access reported by Dehaene & Changeux (2011).
+
+### Emergent gaze — Superior Colliculus
+There is no scripted saccade controller. The `SuperiorColliculus` builds a
+retinotopic priority map each tick:
+
+```
+spatial_sal = motion · (0.3 + 0.7·ACh) + luma · NA + surprise · NA / 10
+              × (1 + 3 · threat)
+priority    = spatial_sal · (1 − IOR) + goal · 0.08
+```
+
+`luma` is read from the post-recurrent activity of visual neurons, which
+includes top-down feedback. Hearing the token "tree" → activates the concept
+neurons → STDP-learned back-connections fire visual neurons that previously
+co-occurred with trees → priority elevates at tree locations → the eye saccades
+there. This is voluntary, language-directed gaze emerging from the substrate,
+not a Python control flow.
 
 ### Volition — Libet delay + somatic markers
-The `FreeWillEngine` places every motor decision into a queue with a configurable delay (default: 15 ticks). The decision is realizable only when it clears the queue. Somatic markers (Damasio, 1994) bias action probabilities based on pain history: actions that previously caused high stress are suppressed proportionally to amygdala arousal (noradrenaline).
+Every motor decision passes through a 15-tick queue (`FreeWillEngine`); during
+that delay, the insula can veto the action if accumulated interoceptive valence
+predicts harm (Damasio 1994; Libet 1983).
 
-### Temporal consciousness — Husserlian "thick present"
-The `HusserlianTime` module implements Husserl's phenomenology of inner time: the conscious moment is not an instantaneous point but a weighted blend of retention (recent past), primal impression (now), and protention (predicted near-future).
+### Continuous time
+Axonal delays are modeled per-synapse via a GPU ring buffer (Swadlow 1985).
+Short-term synaptic plasticity (Tsodyks & Markram 1997), refractory periods
+(Hodgkin & Huxley 1952), spike-frequency adaptation, and k-WTA lateral
+inhibition (Buzsáki 2004) give the simulation continuous-time dynamics rather
+than discrete layer-by-layer updates.
 
-```
-thick_now = 0.6 × primal_impression + 0.3 × retention_smear + 0.1 × protention
-```
-
-### Mood attractors
-The agent's emotional state is modeled as a dynamical system with three attractor basins — *calm*, *anxiety*, *depression* — defined by energy/stress coordinates. Dopamine levels modulate the depth of each basin. The agent can fall into depressive states under sustained energy deprivation regardless of any external programmer intervention.
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/{username}/mindai.git
-cd mindai
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux / macOS
-pip install -r requirements.txt
-```
-
-**Requirements:** Python 3.10+, PyTorch (CUDA optional), NumPy, SciPy, PyGame, PyYAML, PyAudio
-
----
-
-## Running
-
-```bash
-python main.py
-```
-
-If `savegame.pkl` exists, you will be prompted to resume the saved brain state.
-
-### Controls
-
-| Key | Action |
-|-----|--------|
-| `Arrow keys` | Move human agent |
-| `E` | Interact with AI (triggers oxytocin) |
-| `V` | Enable microphone input (live audio → cochlea) |
-| `+` / `-` | Cycle simulation speed (1 / 5 / 10 / 25 / 60 FPS / MAX) |
-| `Q` | Quit and save brain state |
-
-### Simulation speed levels
-
-| Level | FPS | Use case |
-|-------|-----|----------|
-| 1 | 1 | Frame-by-frame observation |
-| 2 | 5 | Slow-motion study |
-| 3 | 10 | Default observation |
-| 4 | 25 | Normal run |
-| 5 | 60 | Fast run |
-| 6 | MAX | Accelerated evolution |
+### 15-modulator endocrine system
+| Modulator       | Source                | Primary role                                   |
+|-----------------|-----------------------|------------------------------------------------|
+| Dopamine (3 paths) | VTA, SN            | Reward prediction · cognitive gating · movement |
+| Serotonin       | Raphe / gut           | Mood baseline · post-meal satiety              |
+| Noradrenaline   | Locus coeruleus       | Thalamic gain · arousal · SC orienting         |
+| Cortisol        | HPA axis              | Stress · synaptic damage at sustained high levels |
+| Oxytocin        | Hypothalamus          | Social trust · mirror neuron up-regulation     |
+| Endorphins      | Pituitary / PAG       | Analgesia · post-reward plasticity boost       |
+| Adrenaline      | Adrenal medulla       | Fight-or-flight                                |
+| Acetylcholine   | Basal forebrain       | STDP precision gate · novelty                  |
+| Anandamide      | Endocannabinoid       | CB1 → CA1 LTP suppression (forgetting)         |
+| Substance P     | Spinal DRG / PAG      | Two-phase pain wind-up                         |
+| Ghrelin         | Stomach X/A cells     | Pre-meal VTA dopamine drive                    |
+| Leptin          | Adipocytes            | Post-meal satiety                              |
+| Vasopressin     | Hypothalamus / SON    | Territorial vigilance                          |
+| Prolactin       | Anterior pituitary    | Post-stress affiliative drive                  |
+| Insulin         | Pancreatic β-cells    | Post-meal → tryptophan → serotonin             |
 
 ---
 
-## Configuration
+## Cross-modal grounding
 
-All parameters live in `config/default_sim.yaml`:
+Concepts are learned by simultaneous activation across sensory channels — STDP
+binds whichever neurons happen to be coactive. A video that says "this is a
+tree" while showing a tree produces:
 
-```yaml
-hardware:
-  num_nodes: 9370          # total neurons
-  spatial_dimensions: 3    # 3D geometry for axonal delay computation
-
-biology:
-  base_energy: 3000.0
-  inhibitory_ratio: 0.2    # ~20% GABA neurons (Dale's principle)
-
-consciousness:
-  volition_delay_ticks: 15 # Libet readiness potential analogue
-  temporal_window_size: 7  # Husserlian retention buffer depth
-
-plasticity:
-  hebbian_ltp_rate: 0.08
-  pruning_half_life: 300
-
-lifecycle:
-  circadian_cycle_ticks: 5000
-  rem_sleep_duration: 500
 ```
+Cochlea[tree_phonemes] + FovealRetina[tree_pixels]
+       → STDP binds [tree_pixels] ↔ [tree_phonemes]
+
+FovealRetina[tree_pixels] + Token[derevo]   (caption "это дерево")
+       → STDP binds [tree_pixels] ↔ [token_derevo]
+
+FovealRetina[pixels_of_the_word_"дерево"] + Token[derevo]
+       → STDP binds the visual word-form to the same token
+```
+
+After training, all four representations (sight, sound, spoken token, written
+token) converge on the same neuron cluster. Asking "что рядом с деревом?"
+activates the cluster, which through learned top-down connections elevates
+luma in tree-shaped regions of the retinal priority map — and the eye looks
+there.
 
 ---
 
 ## Module map
 
 ```
-src/
+mindai/
+├── brain.py                              Main tick loop, module orchestration
+├── layout.py                             SensoryLayout — named channels → neuron indices
+│
 ├── engine/
-│   ├── plasticity_core.py        Connectome · STDP · synaptogenesis · homeostasis
-│   ├── temporal_windows.py       Husserlian thick present
-│   ├── spatial_topology_3d.py    3D neuron geometry for conduction delays
-│   └── axonal_delays.py          Spike queue with per-synapse travel time
+│   ├── plasticity_core.py                STDP, STP, refractory, adaptation, lateral inhibition
+│   ├── temporal_windows.py               Theta-gamma temporal binding (Lisman & Jensen 2013)
+│   └── axonal_delays.py                  Per-synapse axonal delay queue (Swadlow 1985)
 │
 ├── architecture/
-│   ├── predictive_hierarchy.py   Predictive coding (L2/3 error · L5/6 prediction)
-│   ├── thalamocortical_core.py   Attention gate · noradrenaline-driven threshold
-│   ├── hippocampus_buffer.py     Episodic encoding · valence gating · consolidation
-│   ├── prefrontal_cortex.py      Working memory / executive control
-│   └── semantic_memory.py        Concept extraction during sleep
+│   ├── predictive_hierarchy.py           Rao & Ballard 1999
+│   ├── thalamocortical_core.py           Crick 1984
+│   ├── prefrontal_cortex.py              Wallis 2007
+│   ├── cortical_areas.py / cortical_layers.py  Zeki 1978; Elston 2003
+│   ├── hippocampus_buffer.py             Scoville & Milner 1957
+│   ├── hippocampus_subfields.py          DG/CA3/CA1 pattern separation (Marr 1971)
+│   ├── entorhinal.py                     Grid cells (Hafting 2005)
+│   ├── amygdala.py                       Dual-path fear (LeDoux 1996)
+│   ├── habenula.py                       Anti-reward (Matsumoto & Hikosaka 2007)
+│   ├── pag.py                            Fight / flight / freeze (Bandler & Shipley 1994)
+│   ├── insula.py                         Interoception (Craig 2002)
+│   ├── anterior_cingulate.py             Conflict monitoring (Botvinick 2001)
+│   ├── cerebellum.py                     Forward model + climbing-fibre LTD (Ito 1984)
+│   ├── superior_colliculus.py            Retinotopic saccade map (Wurtz & Goldberg 1989)
+│   ├── biological_motion_detector.py     MT+/V5 (Grossman & Blake 2002)
+│   ├── default_mode_network.py           Autobiographical replay (Raichle 2001)
+│   ├── visuospatial_sketchpad.py         Spatial working memory (Baddeley 1986)
+│   ├── theory_of_mind.py                 Other-agent modeling (Saxe 2003)
+│   ├── semantic_memory.py                Concept extraction during sleep (Diekelmann 2010)
+│   ├── astrocytes.py                     Glial weight stability (Volterra 2005)
+│   └── olfactory_bulb.py                 Non-thalamic sensory route (Buck & Axel 1991)
 │
 ├── consciousness/
-│   ├── global_workspace.py       Kuramoto synchrony · ignition broadcast
-│   ├── qualia_space_iit.py       Φ approximation via eigenvalue geometry
-│   ├── volition_and_agency.py    BasalGanglia + FreeWillEngine (Libet delay)
-│   └── self_model_ego.py         Interoceptive self-prediction · sense of agency
+│   ├── global_workspace.py               Kuramoto ignition (Baars 1988; Dehaene 2001)
+│   ├── self_model_ego.py                 Sense of agency (Wegner 1999)
+│   ├── volition_and_agency.py            BasalGanglia + FreeWillEngine
+│   └── neural_complexity.py              LZ76 + spectral radius (Casali 2013)
 │
 ├── neurochemistry/
-│   ├── neuromodulators.py        Seven-hormone endocrine system · Pavlovian DA
-│   └── attractor_dynamics.py     Mood basins (calm / anxiety / depression)
+│   └── neuromodulators.py                15-modulator endocrine system
 │
 ├── lifecycle/
-│   ├── sleep_consolidation.py    Hippocampal replay · cortisol memory distortion
-│   └── circadian_rhythm.py       Adenosine + melatonin → sleep pressure
+│   ├── sleep_consolidation.py            NREM/REM, replay, lucid dreaming (Diekelmann 2010)
+│   └── circadian_rhythm.py               Adenosine + melatonin (Borbély 1982)
 │
-└── environment/
-    ├── world_2d.py               40×40 grid · terrain · objects · human/agent actions
-    ├── vision_system.py          Foveal retina encoding
-    ├── hearing_system.py         32-band cochlear filterbank · microphone input
-    └── ui_renderer.py            Real-time PyGame display · neuromodulator HUD
+├── environment/
+│   └── hearing_system.py                 ERB cochlea (Glasberg & Moore 1990)
+│
+├── feels/                                FeelingSystem — Stevens 1957, Weber-Fechner
+├── speech/                               Vocal apparatus + ear (faster-whisper)
+├── worlds/
+│   ├── agent_world.py                    Multimodal training + chat (primary)
+│   ├── minecraft/                        Minecraft connector + foveal retina
+│   └── tokenizers/                       tiktoken cl100k_base wrapper
+├── hardware/                             Neuromorphic backend (Lava / Loihi)
+└── consciousness/neural_complexity.py    LZ76 perturbational complexity (Casali 2013)
 ```
+
+---
+
+## Installation and running
+
+```bash
+git clone https://github.com/mellson19/mindai.git
+cd mindai
+python -m venv .venv
+.venv\Scripts\activate                     # Windows; on Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+
+# Primary: multimodal agent (LLM analog)
+python main_agent.py                       # stdin chat + training
+python main_agent.py --gui                 # browser UI with drag-drop and voice
+python main_agent.py --remote ws://IP      # offload brain to a GPU server
+python main_agent.py --download ws://IP    # pull trained weights from a server
+
+# Optional GPU server (Colab T4 / private)
+python server.py --ngrok                   # exposes /chat and /ws via tunnel
+# See colab_server.ipynb for a one-click Colab T4 deployment
+
+# Secondary entry points
+python main.py train                       # 2D GridWorld bootstrap (legacy)
+python main_minecraft.py                   # Minecraft world
+```
+
+**Requirements:** Python 3.10+, PyTorch (CUDA strongly recommended for 1.5M neurons),
+NumPy, SciPy, tiktoken. Optional: FastAPI + edge-tts + faster-whisper for the
+Web GUI; `av` or `moviepy` for video; `pyngrok` for tunneling.
+
+---
+
+## Data layout for multimodal training
+
+```
+data/
+├── corpus.txt                paragraph-separated text
+├── qa.txt                    question / answer pairs (alternating lines)
+├── paired/                   images and videos with optional .txt captions
+│   ├── chair.jpg
+│   ├── chair.txt             "I see a chair. This is a chair."
+│   ├── lecture.mp4
+│   └── lecture.txt
+└── audio/                    standalone audio files
+```
+
+Curriculum weights (`main_agent.py:_CURRICULUM`): 65% text, 30% paired media,
+5% Q&A.
 
 ---
 
 ## Save format
 
-Brain state is serialized as `savegame.pkl` using `scipy.sparse.coo_matrix` (not PyTorch tensors) to keep file sizes manageable. On load, weights are transferred back to GPU. The save includes full world state, inventory, and all neuron weights and integrity values.
+```
+savegame_brain/
+├── brain.json                tick, num_neurons, mood, metadata
+└── weights.npz               sparse synapse matrix (row, col, w, integrity)
+```
 
-A migration utility `surgery.py` remaps saved synapse indices after the neuron layout is expanded.
+Brains migrate cleanly between worlds while retaining learned weights, provided
+`num_neurons` matches.
 
 ---
 
 ## What this is not
 
-- **Not a deep learning model.** `torch.set_grad_enabled(False)` is set at startup. There is no optimizer, no loss function, no backpropagation anywhere in the codebase.
-- **Not a reinforcement learning agent.** There is no reward signal fed to a policy. Dopamine arises from internal physiology, not from an external evaluator.
-- **Not a chatbot or language model.** The agent has no natural language capacity. It communicates through vocalizations (32-dimensional neural activity mapped to sound) and through action.
-- **Not a finished product.** This is active research into whether the combination of GWT, IIT, PP, and SMH in a single embodied system produces behavior that resembles conscious experience.
+- **Not a deep learning model.** No gradient descent anywhere in the codebase.
+  Plasticity is local; the global error signal that defines deep learning does
+  not exist here.
+- **Not a reinforcement learning agent.** Dopamine is a physiological state
+  variable driven by predicted homeostatic change, not a reward channel set by
+  the developer. Reward shaping is forbidden by project rules.
+- **Not a transformer.** No attention layers, no positional encoding, no
+  layered embed/MLP stack. The computational graph is a recurrent sparse matrix
+  over anatomically defined regions.
+- **Not biologically complete.** ~30 modules cover only a tiny fraction of what
+  the brain does. Glial dynamics are simplified, glutamate / GABA are the only
+  two transmitter classes treated explicitly at the synapse level, axonal
+  delay realism is capped at 20 ticks, and several modules (counterfactual
+  engine, IIT-style Φ space) are deprecated or stubbed.
+- **Not benchmarked against LLMs.** This is research into whether the right
+  combination of biological mechanisms produces emergent cognition in a single
+  embodied system. It is not, and may never be, competitive with statistical
+  language models on standard NLP tasks. That is by design — different
+  question, different tools.
+
+---
+
+## Known limitations (tracked, not hidden)
+
+- `PredictiveMicrocircuits` td/bu activations lack a clamp and can grow
+  unboundedly under sustained surprise.
+- STDP `pre_trace` and `post_trace` are both written to 1.0 within the same
+  tick, partially erasing temporal ordering — to be replaced with a continuous
+  decaying eligibility trace.
+- `GlobalWorkspace.history_buffer` uses `list.pop(0)` — O(n); should be a
+  `collections.deque(maxlen=N)`.
+- IIT-style Φ space (`qualia_space_iit.py`) and `counterfactual_engine.py` are
+  dead code, kept for reference; LZ76 complexity (`neural_complexity.py`) is
+  the operational consciousness metric.
 
 ---
 
@@ -298,26 +441,35 @@ A migration utility `surgery.py` remaps saved synapse indices after the neuron l
 
 - Baars, B. J. (1988). *A Cognitive Theory of Consciousness.* Cambridge University Press.
 - Bi, G., & Poo, M. (1998). Synaptic modifications in cultured hippocampal neurons. *Journal of Neuroscience*, 18(24).
+- Borbély, A. A. (1982). A two-process model of sleep regulation. *Human Neurobiology*, 1(3).
+- Botvinick, M. M., et al. (2001). Conflict monitoring and cognitive control. *Psychological Review*, 108(3).
+- Casali, A. G., et al. (2013). A theoretically based index of consciousness independent of sensory processing and behavior. *Science Translational Medicine*, 5(198).
+- Craig, A. D. (2002). How do you feel? Interoception. *Nature Reviews Neuroscience*, 3(8).
+- Curcio, C. A., et al. (1990). Human photoreceptor topography. *Journal of Comparative Neurology*, 292(4).
 - Damasio, A. (1994). *Descartes' Error.* Putnam.
 - Dehaene, S., & Changeux, J.-P. (2011). Experimental and theoretical approaches to conscious processing. *Neuron*, 70(2).
-- Friston, K. (2010). The free-energy principle: a unified brain theory? *Nature Reviews Neuroscience*, 11(2).
+- Diekelmann, S., & Born, J. (2010). The memory function of sleep. *Nature Reviews Neuroscience*, 11(2).
+- Glasberg, B. R., & Moore, B. C. J. (1990). Derivation of auditory filter shapes from notched-noise data. *Hearing Research*, 47.
+- Hafting, T., et al. (2005). Microstructure of a spatial map in the entorhinal cortex. *Nature*, 436.
 - Hebb, D. O. (1949). *The Organization of Behavior.* Wiley.
-- Kuramoto, Y. (1975). Self-entrainment of a population of coupled non-linear oscillators. *Lecture Notes in Physics*, 39.
-- Libet, B. et al. (1983). Time of conscious intention to act in relation to onset of cerebral activity. *Brain*, 106(3).
-- Tononi, G. (2004). An information integration theory of consciousness. *BMC Neuroscience*, 5(42).
+- Hodgkin, A. L., & Huxley, A. F. (1952). A quantitative description of membrane current. *Journal of Physiology*, 117(4).
+- Ito, M. (1984). *The Cerebellum and Neural Control.* Raven Press.
+- LeDoux, J. (1996). *The Emotional Brain.* Simon & Schuster.
+- Libet, B., et al. (1983). Time of conscious intention to act in relation to onset of cerebral activity. *Brain*, 106(3).
+- Lisman, J. E., & Jensen, O. (2013). The theta-gamma neural code. *Neuron*, 77(6).
+- Marr, D. (1971). Simple memory: a theory for archicortex. *Phil. Trans. R. Soc. B*, 262(841).
+- Matsumoto, M., & Hikosaka, O. (2007). Lateral habenula as a source of negative reward signals. *Nature*, 447.
+- Rao, R. P. N., & Ballard, D. H. (1999). Predictive coding in the visual cortex. *Nature Neuroscience*, 2(1).
+- Reynolds, J. N. J., & Wickens, J. R. (2002). Dopamine-dependent plasticity of corticostriatal synapses. *Neural Networks*, 15(4–6).
+- Tsodyks, M. V., & Markram, H. (1997). The neural code between neocortical pyramidal neurons. *PNAS*, 94(2).
 - Turrigiano, G. G. (2008). The self-tuning neuron: synaptic scaling of excitatory synapses. *Cell*, 135(3).
-
----
-
-## Star history
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mellson19/mindai&type=Date)](https://star-history.com/#{username}/mindai&Date)
+- Wurtz, R. H., & Goldberg, M. E. (1989). *The Neurobiology of Saccadic Eye Movements.* Elsevier.
 
 ---
 
 <div align="center">
 
-*The question is not whether machines can think.*  
+*The question is not whether machines can think.*
 *The question is whether thinking can emerge from the right kind of physics.*
 
 </div>
