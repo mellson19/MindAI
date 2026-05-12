@@ -1,0 +1,1366 @@
+"""Brain — biologically-inspired artificial mind.
+
+Core design
+-----------
+The Brain is the substrate.  Everything else is optional:
+
+    from mindai import Brain
+    from mindai.worlds.agent_world import AgentWorld
+    from mindai.neurochemistry.neuromodulators import EndocrineSystem
+
+    world = AgentWorld(text_corpus='corpus.txt')
+
+    # Minimal brain (works alone — no feelings, no hormones)
+    brain = Brain(num_neurons=500_000,
+                  sensory_layout=world.sensory_layout,
+                  motor_layout=world.motor_layout)
+    brain.run(world, headless=True)
+
+    # With optional feelings (psychophysical curves over world signals)
+    from mindai.feels import FeelingSystem, Feel, curves
+    feels = FeelingSystem()
+    feels.add(Feel('pain',   'pain',   curve=curves.power(1.5)))
+    feels.add(Feel('hunger', 'hunger', curve=curves.quadratic))
+    brain.attach(feels)
+
+    # With optional hormones
+    brain.attach(EndocrineSystem())
+
+    brain.run(world)
+
+All learning is Hebbian/STDP — no gradient descent, no reward function.
+Behaviour emerges from physiology gated by feelings and neuromodulators.
+
+Save format
+-----------
+Brain state is saved to a *directory* (separate from world state):
+
+    save_dir/
+        brain.json      tick, num_neurons, metadata
+        weights.npz     sparse synapse matrix (row, col, w, integrity)
+
+World state is saved separately by the user's world connector code.
+This allows the brain to be migrated to a different world while retaining
+learned synaptic structure — exactly as a biological brain retains memories
+when moved to a new environment.
+
+Backward compat: if save_path ends with ``.pkl``, the old pickle format
+is used for both load and save.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pickle
+import time
+from pathlib import Path
+
+import numpy as np
+import scipy.sparse as sp
+import torch
+
+from mindai.layout import SensoryLayout
+from mindai.engine.plasticity_core import StructuralPlasticity
+from mindai.engine.spatial_topology_3d import BrainGeometry
+from mindai.engine.temporal_windows import HusserlianTime
+from mindai.architecture.predictive_hierarchy import PredictiveMicrocircuits
+from mindai.architecture.thalamocortical_core import Thalamus
+from mindai.architecture.hippocampus_buffer import Hippocampus
+from mindai.architecture.prefrontal_cortex import PrefrontalCortex
+from mindai.architecture.semantic_memory import SemanticMemory
+from mindai.architecture.cortical_layers import CorticalLayers
+from mindai.architecture.cortical_areas import CorticalAreas
+from mindai.architecture.biological_motion_detector import BiologicalMotionDetector
+from mindai.architecture.cerebellum import Cerebellum
+from mindai.architecture.anterior_cingulate import AnteriorCingulate
+from mindai.architecture.insula import Insula
+from mindai.architecture.default_mode_network import DefaultModeNetwork
+from mindai.architecture.visuospatial_sketchpad import VisuospatialSketchpad
+from mindai.architecture.theory_of_mind import TheoryOfMind
+from mindai.engine.axonal_delays import DelayQueue, build_delay_tensor
+from mindai.consciousness.global_workspace import PhaseCoupledWorkspace
+from mindai.consciousness.self_model_ego import EgoModel
+from mindai.consciousness.volition_and_agency import FreeWillEngine, BasalGanglia
+from mindai.consciousness.neural_complexity import NeuralComplexity
+from mindai.architecture.amygdala import Amygdala
+from mindai.architecture.habenula import Habenula
+from mindai.architecture.pag import PAG
+from mindai.architecture.astrocytes import Astrocytes
+from mindai.architecture.hippocampus_subfields import HippocampalSubfields
+from mindai.architecture.entorhinal import EntorhinalGrid
+from mindai.architecture.olfactory_bulb import OlfactoryBulb
+from mindai.lifecycle.sleep_consolidation import SleepCycle, SleepPhase
+from mindai.lifecycle.circadian_rhythm import BiologicalClock
+from mindai.architecture.superior_colliculus import SuperiorColliculus
+
+
+# ---------------------------------------------------------------------------
+# Null-object fallbacks for optional modules
+# ---------------------------------------------------------------------------
+
+class _NullChemistry:
+    """Neutral chemistry — returned when no EndocrineSystem is attached.
+
+    All values represent a resting, non-stressed organism.  The brain functions
+    without hormones but learns more slowly and without emotional gating.
+    This is biologically equivalent to a decerebrate preparation: neural
+    activity continues, plasticity is uniform, motivation is absent.
+    """
+    dopamine               = 0.5
+    noradrenaline          = 0.5
+    cortisol               = 0.0
+    oxytocin               = 0.0
+    adrenaline             = 0.0
+    endorphins             = 0.0
+    boredom                = 0.0
+    acetylcholine          = 0.5
+    anandamide             = 0.0
+    substance_p            = 0.0
+    ghrelin                = 0.0
+    leptin                 = 0.5
+    vasopressin            = 0.0
+    prolactin              = 0.0
+    insulin                = 0.0
+    effective_pain_signal  = 0.0
+    effective_hunger_signal= 0.0
+    hippocampal_salience_gate = 1.0
+    mirror_neuron_amplifier   = 0.5
+
+    def get_plasticity_multiplier(self): return 1.0
+    def update_state(self, **kw): pass
+    def trigger_social_bonding(self): pass
+    def trigger_endorphin_rush(self): pass
+
+
+_NULL_CHEM = _NullChemistry()
+
+
+# ---------------------------------------------------------------------------
+# Brain
+# ---------------------------------------------------------------------------
+
+class Brain:
+    """Biologically-inspired artificial mind.
+
+    Parameters
+    ----------
+    num_neurons:
+        Total neuron count.
+    sensory_layout:
+        Dict of channel_name → int (size).  Special key ``'vision'`` is always
+        placed first at index 0.  Remaining channels are placed contiguously.
+    motor_layout:
+        Dict of channel_name → int or (start, end) tuple.  ``'motor'`` and
+        ``'vocalization'`` are the standard keys; ``'mirror_neurons'`` can be
+        a relative-offset tuple inside the motor block.
+    device:
+        ``'auto'``, ``'cpu'``, or ``'cuda'``.
+    save_path:
+        Path to save the brain.  Use a directory path (e.g. ``'savegame/'``)
+        for the new format, or a ``.pkl`` file for the legacy format.
+    num_actions:
+        Number of distinct motor actions (fed to BasalGanglia).
+    """
+
+    def __init__(
+        self,
+        num_neurons:         int,
+        sensory_layout:      dict,
+        motor_layout:        dict,
+        device:              str   = 'auto',
+        save_path:           str   = 'savegame',
+        num_actions:         int   = 5,
+        synapse_density:     float = 0.01,
+    ) -> None:
+        if device == 'auto':
+            if torch.cuda.is_available():
+                # Estimate synapse memory: (N*0.2)^2 * density * 32 bytes
+                needed_gb = (num_neurons * 0.2) ** 2 * synapse_density * 32 / 1e9
+                free_gb   = torch.cuda.get_device_properties(0).total_memory / 1e9 * 0.85
+                if needed_gb <= free_gb:
+                    self._device = torch.device('cuda')
+                else:
+                    print(f'>>> VRAM {free_gb:.1f} GB < нужно {needed_gb:.1f} GB → CPU')
+                    self._device = torch.device('cpu')
+            else:
+                self._device = torch.device('cpu')
+        else:
+            self._device = torch.device(device)
+
+        self.save_path = save_path
+
+        self._layout = SensoryLayout.from_channels(
+            vision_size=int(sensory_layout.get('vision', 0)),
+            sensory={k: v for k, v in sensory_layout.items() if k != 'vision'},
+            motor=motor_layout,
+            num_neurons=num_neurons,
+        )
+
+        torch.set_grad_enabled(False)
+        self.num_neurons = num_neurons
+        print(f'>>> Инициализация разума: {num_neurons} нейронов на {self._device}')
+
+        # Core neural substrate — always present
+        self._plasticity    = StructuralPlasticity(num_neurons, initial_density=synapse_density)
+        self._time          = HusserlianTime(num_neurons, window_size=3)
+        self._predictor     = PredictiveMicrocircuits(num_neurons)
+        self._workspace     = PhaseCoupledWorkspace(num_neurons, self._device)
+        self._thalamus      = Thalamus(num_neurons, self._device)
+        self._ego           = EgoModel(expected_baseline=1.0)
+        self._clock         = BiologicalClock(cycle_length_ticks=1500)
+        self._sleep         = SleepCycle()
+        vision_size = int(sensory_layout.get('vision', 0))
+        self._sleep.set_visual_mask(vision_size, num_neurons)
+        # Superior Colliculus — only meaningful when vision is present
+        self._sc: SuperiorColliculus | None = (
+            SuperiorColliculus() if vision_size > 0 else None
+        )
+        self._hippocampus   = Hippocampus()
+        # New biology — anti-reward, defence switch, glia, hippocampal subfields,
+        # grid/place coding, olfaction
+        self._habenula      = Habenula()
+        self._pag           = PAG()
+        self._astrocytes    = Astrocytes(device=self._device)
+        self._hipp_subf     = HippocampalSubfields()
+        self._entorhinal    = EntorhinalGrid()
+        self._olfactory     = OlfactoryBulb()
+        self._free_will     = FreeWillEngine(delay_ticks=3)
+        self._pfc           = PrefrontalCortex(num_neurons)
+        self._semantics     = SemanticMemory()
+        self._nc            = NeuralComplexity(num_neurons)
+        self._geometry      = BrainGeometry(num_neurons)
+        # Amygdala — fear conditioning (LeDoux 1996); receives sensory slice
+        _sensory_size = sum(sensory_layout.values())
+        self._amygdala = Amygdala(num_sensory=min(_sensory_size, num_neurons))
+        self._basal_ganglia = BasalGanglia(
+            motor_cortex_size=self._layout.size('motor'),
+            num_actions=num_actions,
+        )
+
+        # Biological motion detector — MT+/V5 analog (Grossman & Blake 2002)
+        self._motion_detector = BiologicalMotionDetector(
+            vision_size=int(sensory_layout.get('vision', 0)))
+
+        # Cortical areas — functional specialisation map (Zeki 1978)
+        self._areas = CorticalAreas(num_neurons)
+
+        # Cerebellum — forward model, climbing-fibre error (Ito 1984)
+        _motor_size = self._layout.size('motor') if self._layout.has('motor') else 10
+        _rea_size   = int(sensory_layout.get('vision', 100))
+        self._cerebellum = Cerebellum(motor_size=_motor_size, reafference_size=_rea_size)
+
+        # ACC — conflict monitoring + ERN (Botvinick 2001)
+        self._acc = AnteriorCingulate(num_actions=num_actions)
+
+        # Insula — interoception + body-state valence (Craig 2002)
+        self._insula = Insula()
+
+        # Default Mode Network — self-referential thought (Raichle 2001)
+        self._dmn = DefaultModeNetwork(pattern_size=num_neurons)
+
+        # Visuospatial sketchpad — spatial working memory (Baddeley 1986)
+        _vw = getattr(self, '_vision_w', 24)
+        self._visuospatial = VisuospatialSketchpad(vision_width=_vw, vision_height=_vw)
+
+        # Theory of Mind — other-agent mental state inference (Saxe 2003)
+        self._tom = TheoryOfMind()
+
+        # Cortical layers — canonical microcircuit (Douglas & Martin 1991)
+        self._layers = CorticalLayers(num_neurons, self._device)
+        self._layers.apply_canonical_bias(self._plasticity)
+
+        # Axonal delays — GPU ring buffer (Swadlow 1985)
+        self._delay_queue = DelayQueue(
+            num_neurons, max_delay_ticks=20, device=self._device)
+        self._edge_delays = build_delay_tensor(
+            self._plasticity.indices[0],
+            self._plasticity.indices[1],
+            self._geometry.coordinates,
+            device=self._device,
+        )
+
+        self._activity = torch.zeros(num_neurons, device=self._device)
+
+        # Phonological loop — vocal echo feedback buffer (Baddeley 1986)
+        # The brain hears its own vocalizations with a ~150–300 ms delay
+        # (articulatory loop: Broca → supramarginal gyrus → auditory cortex).
+        # At 10 Hz this is 2–3 ticks. Implemented as a ring buffer of depth 3.
+        # Decay 0.7× per tick: echo is quieter than the original (air dampening).
+        # This gives STDP a pre→post temporal window: the vocal motor output
+        # (pre) precedes the auditory echo (post) by 2 ticks — STDP can now
+        # strengthen the vocal→auditory path, enabling self-monitoring.
+        _voc_echo_size = int(motor_layout.get('vocalization', 0))
+        if isinstance(_voc_echo_size, tuple):
+            _voc_echo_size = _voc_echo_size[1] - _voc_echo_size[0]
+        if isinstance(_voc_echo_size, float):
+            _voc_echo_size = max(4, int(round(_voc_echo_size * num_neurons)))
+        self._voc_echo_buf: list[np.ndarray] = [
+            np.zeros(max(1, _voc_echo_size), dtype=np.float32)
+            for _ in range(3)   # 3-tick ring buffer
+        ]
+        self._voc_echo_idx: int = 0
+
+        # PFC self-monitoring strength — substrate of lucid dream techniques.
+        # Accumulates when the waking brain frequently encounters high surprise
+        # while PFC goal is active (= the brain habitually questions its state).
+        # This is the biological pathway that MILD, DILD, and reality-check
+        # techniques strengthen — without scripting any specific technique.
+        # Decay τ ≈ 5000 ticks (roughly days-scale at 10 Hz).
+        self._pfc_monitoring_strength: float = 0.0
+
+        # Pinned CPU buffer for zero-copy GPU transfer each tick.
+        # pin_memory() allocates page-locked RAM — the DMA engine can copy
+        # directly to GPU without an intermediate staging copy (2–4× faster
+        # on PCIe than pageable memory, per PyTorch docs).
+        if self._device.type == 'cuda':
+            self._raw_pinned = torch.zeros(num_neurons, dtype=torch.float32).pin_memory()
+        else:
+            self._raw_pinned = None   # CPU path: no pin needed
+
+        # Optional attached modules (None until attach() is called)
+        self._chemistry: object = None   # EndocrineSystem or None
+        self._feelings:  object = None   # FeelingSystem or None
+
+        # Public simulation state
+        self.tick:     int   = 0
+        self.mood:     str   = 'calm'
+        self.surprise: float = 0.0
+        self.wellbeing: float = 1.0
+
+        # Metabolic rate scale for CircadianRhythm.
+        # Default 1.0 = normal body. Set lower (e.g. 0.1) for text-only mode
+        # where motor activity is high but no real metabolic cost exists.
+        self._clock_energy_scale: float = 1.0
+
+    # -------------------------------------------------------------------------
+    # Module attachment
+    # -------------------------------------------------------------------------
+
+    def attach(self, module) -> 'Brain':
+        """Attach an optional module to the brain.
+
+        Accepts any of:
+
+        * ``FeelingSystem`` — psychophysical curves over world signals
+        * ``EndocrineSystem`` — neuromodulators (dopamine, cortisol, etc.)
+        * ``MoodAttractors`` — emotional attractor dynamics
+
+        Returns self for chaining::
+
+            brain.attach(feels).attach(EndocrineSystem())
+        """
+        from mindai.feels.system import FeelingSystem
+        from mindai.neurochemistry.neuromodulators import EndocrineSystem
+
+        if isinstance(module, FeelingSystem):
+            self._feelings = module
+            print(f'>>> FeelingSystem подключена: {list(f.name for f in module)}')
+        elif isinstance(module, EndocrineSystem):
+            self._chemistry = module
+            print('>>> EndocrineSystem (нейрохимия) подключена')
+        else:
+            raise TypeError(
+                f"Unsupported module type: {type(module).__name__}. "
+                f"Expected FeelingSystem or EndocrineSystem.")
+        return self
+
+    # -------------------------------------------------------------------------
+    # Persistence — directory format (brain separate from world)
+    # -------------------------------------------------------------------------
+
+    def _is_legacy_path(self, path: str) -> bool:
+        return str(path).endswith('.pkl')
+
+    def load(self, path: str | None = None) -> bool:
+        """Load brain weights.
+
+        Supports both the new directory format and the legacy ``.pkl`` format.
+        Returns True on success.
+        """
+        p = path or self.save_path
+        if self._is_legacy_path(p):
+            return self._load_pkl(p)
+        return self._load_dir(p)
+
+    def save(self, path: str | None = None) -> None:
+        """Save brain weights (brain state only — world state not included)."""
+        p = path or self.save_path
+        if self._is_legacy_path(p):
+            self._save_pkl(p)
+        else:
+            self._save_dir(p)
+
+    # --- new directory format -------------------------------------------------
+
+    def _save_dir(self, save_dir: str) -> None:
+        d = Path(save_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            idx = self._plasticity.indices.cpu().numpy()
+            w   = self._plasticity.weights_values.cpu().numpy()
+            ig  = self._plasticity.integrity_values.cpu().numpy()
+            # Astrocytic slow EMA — long-term memory stabiliser
+            slow_w = (self._astrocytes._slow_weights.cpu().numpy()
+                      if self._astrocytes._slow_weights is not None else None)
+            payload = {
+                'row': idx[0], 'col': idx[1],
+                'weights': w, 'integrity': ig,
+                'num_neurons': np.array(self.num_neurons),
+            }
+            if slow_w is not None:
+                payload['astro_slow'] = slow_w
+            np.savez_compressed(str(d / 'weights.npz'), **payload)
+
+            meta = {
+                'tick':            self.tick,
+                'num_neurons':     self.num_neurons,
+                'active_limit':    int(self._plasticity.active_limit),
+                'wellbeing':       self.wellbeing,
+                'mood':            self.mood,
+                'age_ticks':       self._plasticity._age_ticks,
+                'habenula_expect': self._habenula._expected_reward,
+                'pfc_monitoring':  self._pfc_monitoring_strength,
+            }
+            (d / 'brain.json').write_text(json.dumps(meta, indent=2))
+
+            # Hippocampal subfields — episodic memory + CA3 attractor
+            hipp_state = {
+                'W_ca3_rec':      self._hipp_subf._W_ca3_rec,
+                'stored_count':   np.array(len(self._hipp_subf._stored_patterns)),
+            }
+            if self._hipp_subf._stored_patterns:
+                hipp_state['stored'] = np.stack(self._hipp_subf._stored_patterns)
+            np.savez_compressed(str(d / 'hippocampus.npz'), **hipp_state)
+
+            # Entorhinal — learned semantic positions of concepts
+            ento_state = {
+                'position':     self._entorhinal.position.tolist(),
+                'concept_pos':  {str(k): v.tolist() for k, v in
+                                 self._entorhinal._concept_pos.items()},
+            }
+            (d / 'entorhinal.json').write_text(json.dumps(ento_state))
+
+            print(f'>>> Мозг сохранён в {d}/')
+        except Exception as e:
+            print(f'>>> Ошибка сохранения мозга: {e}')
+
+    def _load_dir(self, save_dir: str) -> bool:
+        d = Path(save_dir)
+        npz_path  = d / 'weights.npz'
+        json_path = d / 'brain.json'
+        if not npz_path.exists():
+            return False
+        try:
+            data = np.load(str(npz_path))
+            dev  = self._device
+            self._plasticity.indices = torch.tensor(
+                np.vstack((data['row'], data['col'])), dtype=torch.long, device=dev)
+            self._plasticity.weights_values = torch.tensor(
+                data['weights'], dtype=torch.float32, device=dev)
+            self._plasticity.integrity_values = torch.tensor(
+                data['integrity'], dtype=torch.float32, device=dev)
+            # Astrocyte slow EMA — load if present
+            if 'astro_slow' in data.files:
+                self._astrocytes._slow_weights = torch.tensor(
+                    data['astro_slow'], dtype=torch.float32, device=dev)
+            if json_path.exists():
+                meta = json.loads(json_path.read_text())
+                self.tick      = meta.get('tick', 0)
+                self.mood      = meta.get('mood', 'calm')
+                self.wellbeing = meta.get('wellbeing', 1.0)
+                if 'active_limit'    in meta: self._plasticity.active_limit = meta['active_limit']
+                if 'age_ticks'       in meta: self._plasticity._age_ticks   = meta['age_ticks']
+                if 'habenula_expect' in meta: self._habenula._expected_reward = meta['habenula_expect']
+                if 'pfc_monitoring'  in meta: self._pfc_monitoring_strength   = meta['pfc_monitoring']
+            # Hippocampal subfields
+            hipp_p = d / 'hippocampus.npz'
+            if hipp_p.exists():
+                hd = np.load(str(hipp_p))
+                self._hipp_subf._W_ca3_rec = hd['W_ca3_rec']
+                if 'stored' in hd.files:
+                    self._hipp_subf._stored_patterns = list(hd['stored'])
+                    self._hipp_subf._episode_meta = [{} for _ in self._hipp_subf._stored_patterns]
+            # Entorhinal positions
+            ento_p = d / 'entorhinal.json'
+            if ento_p.exists():
+                es = json.loads(ento_p.read_text())
+                self._entorhinal.position = np.asarray(es.get('position', [0,0]), dtype=np.float32)
+                self._entorhinal._concept_pos = {
+                    int(k): np.asarray(v, dtype=np.float32)
+                    for k, v in es.get('concept_pos', {}).items()
+                }
+            print(f'>>> Мозг загружен из {d}/ (тик {self.tick})')
+            return True
+        except Exception as e:
+            print(f'>>> Ошибка загрузки мозга: {e}')
+            return False
+
+    # --- legacy pickle format (backward compat) --------------------------------
+
+    def _save_pkl(self, path: str) -> None:
+        try:
+            idx = self._plasticity.indices.cpu().numpy()
+            w   = self._plasticity.weights_values.cpu().numpy()
+            ig  = self._plasticity.integrity_values.cpu().numpy()
+            n   = self.num_neurons
+            state = {
+                'tick':          self.tick,
+                'weights':       sp.coo_matrix((w,  (idx[0], idx[1])), shape=(n, n)),
+                'integrity':     sp.coo_matrix((ig, (idx[0], idx[1])), shape=(n, n)),
+                'active_limit':  self._plasticity.active_limit,
+                'is_inhibitory': self._plasticity.is_inhibitory,
+            }
+            with open(path, 'wb') as f:
+                pickle.dump(state, f)
+            print(f'>>> Мозг сохранён в {path}')
+        except Exception as e:
+            print(f'>>> Ошибка сохранения: {e}')
+
+    def _load_pkl(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+            w = state['weights'].tocoo()
+            i = state['integrity'].tocoo()
+            dev = self._device
+            self._plasticity.indices = torch.tensor(
+                np.vstack((w.row, w.col)), dtype=torch.long, device=dev)
+            self._plasticity.weights_values = torch.tensor(
+                w.data, dtype=torch.float32, device=dev)
+            self._plasticity.integrity_values = torch.tensor(
+                i.data, dtype=torch.float32, device=dev)
+            self._plasticity.active_limit  = state.get('active_limit',  self._plasticity.active_limit)
+            self._plasticity.is_inhibitory = state.get('is_inhibitory', self._plasticity.is_inhibitory)
+            self.tick = state.get('tick', 0)
+            print(f'>>> Мозг загружен из {path} (тик {self.tick})')
+            return True
+        except Exception as e:
+            print(f'>>> Ошибка загрузки: {e}')
+            return False
+
+    # -------------------------------------------------------------------------
+    # Main loop
+    # -------------------------------------------------------------------------
+
+    def run(
+        self,
+        world,
+        headless:  bool = False,
+        save_path: str | None = None,
+        max_ticks: int | None = None,
+    ) -> None:
+        """Run the simulation loop.
+
+        Parameters
+        ----------
+        world:
+            Any :class:`~mindai.worlds.World` implementation.
+        headless:
+            Skip PyGame rendering and microphone input.
+        save_path:
+            Override ``self.save_path`` for this run.
+        max_ticks:
+            Stop after N ticks (None = run until quit or death).
+        """
+        from mindai.environment.hearing_system import Cochlea
+
+        sp_path = save_path or self.save_path
+        layout  = self._layout
+
+        # Resolve chemistry — use null-object if not attached
+        chem = self._chemistry if self._chemistry is not None else _NULL_CHEM
+
+        if not headless:
+            try:
+                from mindai.environment.ui_renderer import GameUI
+                import pygame
+                ui  = GameUI(world_size=getattr(world, 'size', 40))
+            except ImportError:
+                ui  = None
+            ear = Cochlea(num_bands=layout.size('audio'))
+        else:
+            ui  = None
+            ear = None
+
+        speeds      = [1.0, 0.2, 0.1, 0.04, 0.016, 0.0]
+        speed_names = ['1 FPS', '5 FPS', '10 FPS', '25 FPS', '60 FPS', 'MAX']
+        speed_idx   = 4
+
+        prev_human_pos = list(getattr(world, 'human_pos', [0, 0]))
+        if layout.has('vocalization'):
+            world.last_agent_vocalization = np.zeros(layout.size('vocalization'))
+        if not hasattr(world, 'isolation_ticks'):
+            world.isolation_ticks = 0
+
+        qualia_shape = [0.33, 0.33, 0.33]
+
+        # Pre-cache layout slices — avoids dict lookup + slice() call each tick
+        _sl = lambda n: layout.slice(n) if layout.has(n) else None
+        _sl_vision, _sl_pain, _sl_hunger = _sl('vision'), _sl('pain'), _sl('hunger')
+        _sl_audio,  _sl_motor, _sl_voc   = _sl('audio'),  _sl('motor'), _sl('vocalization')
+        _sz_audio  = layout.size('audio')        if layout.has('audio')        else 32
+        _sz_voc    = layout.size('vocalization') if layout.has('vocalization') else 0
+
+        # Reusable numpy sensory array — avoids np.zeros() allocation every tick
+        _raw_np = np.zeros(self.num_neurons, dtype=np.float32)
+
+        print('>>> ЗАПУСК AGI...')
+        try:
+            while True:
+                self.tick += 1
+                if max_ticks and self.tick > max_ticks:
+                    break
+
+                # --- input & speed -------------------------------------------
+                keys_pressed = {}
+                quit_sim     = False
+                if ui is not None:
+                    keys_pressed, quit_sim, speed_change = ui.handle_events()
+                    if speed_change == 1:
+                        speed_idx = min(5, speed_idx + 1)
+                    if speed_change == -1:
+                        speed_idx = max(0, speed_idx - 1)
+                if quit_sim or keys_pressed.get('q', False):
+                    break
+
+                # === SLEEP PATH ===============================================
+                if self._sleep.is_sleeping:
+                    world.process_human_input(keys_pressed)
+
+                    # Semantic concept tagging is an N2 phenomenon (Diekelmann 2010)
+                    if self._sleep.current_phase == SleepPhase.N2 and self.tick % 50 == 0:
+                        self._semantics.extract_concept_during_sleep(
+                            self._workspace.history_buffer, self._plasticity)
+
+                    sleep_pressure = self._clock.adenosine * 0.5 + self._clock.melatonin * 0.5
+                    sleep_result = self._sleep.process_sleep_tick(
+                        hippocampus=self._hippocampus,
+                        plasticity=self._plasticity,
+                        current_cortisol=getattr(chem, 'cortisol', 0.0),
+                        current_activity_np=self._activity.cpu().numpy(),
+                        sleep_pressure=sleep_pressure,
+                        pfc_monitoring_strength=self._pfc_monitoring_strength,
+                    )
+
+                    # Drive neuromodulators toward phase-correct biological targets (5% lerp/tick)
+                    targets = sleep_result.neuromod_targets
+                    _lerp = lambda cur, tgt: cur + (tgt - cur) * 0.05
+                    if self._chemistry is not None:
+                        self._chemistry.acetylcholine = float(
+                            np.clip(_lerp(chem.acetylcholine, targets['acetylcholine']), 0.0, 1.0))
+                        self._chemistry.noradrenaline = float(
+                            np.clip(_lerp(chem.noradrenaline, targets['noradrenaline']), 0.0, 1.0))
+                        self._chemistry.serotonin = float(
+                            np.clip(_lerp(chem.serotonin,     targets['serotonin']),     0.0, 1.0))
+                        self._chemistry.anandamide = float(
+                            np.clip(_lerp(chem.anandamide,    targets['anandamide']),    0.0, 1.0))
+
+                    # REM: overwrite activity with dream tensor (already on device — no second transfer)
+                    if (sleep_result.current_phase == SleepPhase.REM
+                            and sleep_result.dream_tensor is not None):
+                        self._activity = sleep_result.dream_tensor
+
+                    # Lucid dream: dlPFC re-engages during REM (LaBerge 1985; Voss 2009)
+                    # PFC goal vector biases dream content toward current homeostatic
+                    # needs — the brain can "intend" within the dream.
+                    # EgoModel receives dream activity so self-model updates.
+                    # This is not scripted dream control — it's the same PFC→motor
+                    # pathway active during waking, now operating on dream imagery.
+                    if sleep_result.is_lucid:
+                        if not getattr(self, '_was_lucid', False):
+                            print(f'\n    [ОСОЗНАННЫЙ СОН] Тик {self.tick} — '
+                                  f'dlPFC реактивирована в REM. '
+                                  f'Мониторинг={self._pfc_monitoring_strength:.3f}')
+                            self._was_lucid = True
+                        # PFC goal biases dream activity
+                        pfc_goal = self._pfc.formulate_goal(
+                            energy=getattr(self, '_last_h_ratio', 0.5),
+                            water=getattr(self, '_last_w_ratio', 0.5),
+                            base_resource=1.0,
+                        )
+                        if pfc_goal.any():
+                            pfc_t = torch.tensor(
+                                pfc_goal, dtype=torch.float32, device=self._device)
+                            self._activity = torch.clamp(
+                                self._activity + pfc_t * 0.2, 0.0, 1.0)
+                        # EgoModel: self-model updates during lucid REM
+                        act_np = self._activity.cpu().numpy()
+                        self._ego.evaluate_self(self.wellbeing,
+                                                float(np.mean(act_np)))
+                    else:
+                        self._was_lucid = False
+
+                    # CAR: anticipatory cortisol pulse before natural wake
+                    if self._clock.car_cortisol_boost > 0 and self._chemistry is not None:
+                        self._chemistry.cortisol = float(
+                            np.clip(chem.cortisol + self._clock.car_cortisol_boost * 0.01, 0.0, 1.0))
+
+                    # Phase label in mood field (visible in UI stats)
+                    _phase_labels = {
+                        SleepPhase.N1:  'СОН N1 (засыпание)',
+                        SleepPhase.N2:  'СОН N2 (веретёна)',
+                        SleepPhase.N3:  'СОН N3 (SWS/дельта)',
+                        SleepPhase.REM: 'REM: СНОВИДЕНИЕ',
+                    }
+                    if (sleep_result.current_phase == SleepPhase.REM
+                            and sleep_result.is_lucid):
+                        self.mood = 'REM: ОСОЗНАННЫЙ СОН ✦'
+                    else:
+                        self.mood = _phase_labels[sleep_result.current_phase]
+
+                    if not sleep_result.still_sleeping:
+                        self._clock.is_awake  = True
+                        self._clock.adenosine = 0.0
+                        self._sleep.is_sleeping = False
+                        # Restore awake baselines
+                        if self._chemistry is not None:
+                            self._chemistry.acetylcholine = 0.5
+                            self._chemistry.noradrenaline = 0.1
+                            self._chemistry.serotonin     = 0.5
+
+                # === AWAKE PATH ===============================================
+                else:
+                    # ----------------------------------------------------------
+                    # 1. World signals → feelings → sensory injection
+                    # ----------------------------------------------------------
+                    world_signals = world.get_homeostatic_signals()
+
+                    if self._feelings is not None:
+                        # FeelingSystem applies psychophysical curves
+                        self._feelings.update(world_signals)
+                        self.wellbeing = self._feelings.wellbeing()
+                        dominant = self._feelings.dominant()
+                    else:
+                        # No FeelingSystem: pass raw signals through as-is
+                        self.wellbeing = 1.0 - float(np.mean(list(world_signals.values()) or [0.0]))
+                        dominant = None
+
+                    # Derive h_ratio / w_ratio for neuromodulation
+                    h_ratio = 1.0 - world_signals.get('hunger', 0.0)
+                    w_ratio = 1.0 - world_signals.get('thirst', 0.0)
+                    # Cache for PFC use during lucid dreams
+                    self._last_h_ratio = h_ratio
+                    self._last_w_ratio = w_ratio
+
+                    # Pain for substance_p wind-up (use raw nociceptive signal,
+                    # not the sensitised one, to prevent runaway feedback)
+                    raw_pain_for_chem = world_signals.get('pain', 0.0)
+                    if self._feelings is not None and 'pain' in self._feelings:
+                        raw_pain_for_chem = self._feelings['pain'].raw
+                    # p_sig: sensitised signal from previous tick (substance_p)
+                    p_sig = chem.effective_pain_signal
+
+                    # ----------------------------------------------------------
+                    # 2. Assemble sensory array
+                    # ----------------------------------------------------------
+                    # Reuse pre-allocated buffer — avoids np.zeros() every tick
+                    raw = _raw_np
+                    raw[:] = 0.0
+
+                    # Vision
+                    retina_data = world.get_sensory_retina(self.num_neurons)
+                    raw[:len(retina_data)] = retina_data
+
+                    # Biological motion detection — MT+/V5 (Grossman & Blake 2002)
+                    # Score in [0,1]: how much the visual input looks like biological
+                    # motion (smooth trajectories + structured variance + periodicity).
+                    # Used below to gate mirror-neuron STDP.
+                    _bio_motion_score = self._motion_detector.update(retina_data)
+
+                    # PFC goal vector — vlPFC/OFC homeostatic bias (Wallis 2007)
+                    # formulate_goal() returns a sparse vector with 1.0 at goal neurons;
+                    # scaled by goal_persistence so it fades when deficit is resolved.
+                    pfc_goal = self._pfc.formulate_goal(
+                        energy=h_ratio,
+                        water=w_ratio,
+                        base_resource=1.0,
+                    )
+                    raw += pfc_goal * 0.3   # gentle bias, not override
+
+                    # Feelings → sensory channels (cached slices, no dict lookup)
+                    if self._feelings is not None:
+                        if 'pain' in self._feelings and _sl_pain is not None:
+                            raw[_sl_pain] = max(p_sig, self._feelings['pain'].sensation)
+                        for feel in self._feelings:
+                            if feel.channel == 'pain':
+                                continue
+                            if feel.channel == 'hunger':
+                                sig = max(feel.sensation, chem.effective_hunger_signal)
+                                if _sl_hunger is not None:
+                                    raw[_sl_hunger] = min(1.0, sig)
+                            elif layout.has(feel.channel):
+                                raw[layout.slice(feel.channel)] = feel.sensation
+                    else:
+                        for channel, deficit in world_signals.items():
+                            if channel == 'pain' and _sl_pain is not None:
+                                raw[_sl_pain] = max(p_sig, float(deficit))
+                            elif layout.has(channel):
+                                raw[layout.slice(channel)] = float(np.clip(deficit, 0, 1))
+
+                    # Audio (cached size)
+                    if ear is not None:
+                        ear.is_listening = keys_pressed.get('v', False)
+                        mic_audio = ear.get_auditory_nerve_signal()
+                    else:
+                        mic_audio = np.zeros(_sz_audio, dtype=np.float32)
+                    if _sl_audio is not None:
+                        # Pad/truncate every component to _sz_audio so they sum cleanly
+                        def _fit(x, n):
+                            return np.pad(x, (0, max(0, n - len(x))))[:n]
+                        world_sound = _fit(world.pop_world_sound(), _sz_audio)
+
+                        # Phonological loop echo (Baddeley 1986):
+                        # 2-tick delay between vocal motor and auditory echo
+                        # creates a valid STDP window for vocal→auditory learning.
+                        _echo_read_idx = (self._voc_echo_idx + 1) % 3
+                        vocal_echo = _fit(self._voc_echo_buf[_echo_read_idx] * 0.4, _sz_audio)
+
+                        voc = world.last_agent_vocalization if _sl_voc is not None else np.zeros(0)
+                        voc_part = _fit(voc, _sz_audio) if len(voc) else 0
+                        raw[_sl_audio] = _fit(mic_audio, _sz_audio) + world_sound + vocal_echo + voc_part
+
+                    # Social / human input processing
+                    #
+                    # Mirror neurons and oxytocin are NOT scripted here.
+                    # Both emerge entirely from STDP:
+                    #
+                    #   Mirror neurons (Rizzolatti 1996):
+                    #     The visual cortex processes whatever is on screen.
+                    #     When the AI watches a human chop a tree, V1→MT→STS
+                    #     encodes the motion pattern. Over repeated observation
+                    #     co-occurring with the AI's own motor output, STDP
+                    #     strengthens the visual→motor path. The 'mirror_neurons'
+                    #     layout slot marks neurons at the V→M intersection —
+                    #     no special activation code needed.
+                    #
+                    #   Oxytocin (Insel 1992):
+                    #     Innate triggers are touch and smell — absent here.
+                    #     Visual oxytocin requires learned association.
+                    #     It emerges after the brain pairs "human visual pattern"
+                    #     with social reward via STDP. No distance proxy injected.
+                    #
+                    # GridWorld human interaction (keyboard-driven world only):
+                    world.process_human_input(keys_pressed)
+                    prev_human_pos = list(getattr(world, 'human_pos', prev_human_pos))
+                    human_interacted = keys_pressed.get('e', False)
+                    if human_interacted:
+                        chem.trigger_social_bonding()
+                    if human_interacted and self.tick % 3 == 0:
+                        if hasattr(world, 'human_interact'):
+                            world.human_interact()
+
+                    # DMN autobiographical replay — injected before GPU transfer
+                    # (DMN.update() called after act_cpu; use previous tick's pattern here)
+                    _dmn_replay = getattr(self, '_dmn_replay_prev', None)
+                    if _dmn_replay is not None and len(_dmn_replay):
+                        n = min(len(_dmn_replay), len(raw))
+                        raw[:n] += _dmn_replay[:n] * 0.15
+
+                    # Insula — interoception + body-state valence (Craig 2002)
+                    insula_out = self._insula.update(
+                        pain=world_signals.get('pain', 0.0),
+                        hunger=world_signals.get('hunger', 0.0),
+                        thirst=world_signals.get('thirst', 0.0),
+                        arousal=float(np.mean(raw)),
+                    )
+
+                    # Amygdala — dual-path fear conditioning (LeDoux 1996).
+                    # Runs on CPU sensory array before GPU transfer.
+                    amyg_out = self._amygdala.update(
+                        raw, raw_pain_for_chem, chem.dopamine)
+                    if self._chemistry is not None:
+                        # CeA → LC: threat boosts noradrenaline.
+                        # 5-HT from dorsal raphe suppresses CeA fear output (Gross & Canteras 2012).
+                        _threat_na = amyg_out['threat_level'] * (1.0 - chem.serotonin * 0.5)
+                        self._chemistry.noradrenaline = float(np.clip(
+                            chem.noradrenaline + _threat_na * 0.05, 0.1, 1.0))
+                        # DA suppression (aversive prediction error)
+                        self._chemistry.dopamine = float(np.clip(
+                            chem.dopamine - amyg_out['da_suppression'] * 0.02, 0.1, 1.0))
+
+                    # ----------------------------------------------------------
+                    # 3. Neural computation
+                    # ----------------------------------------------------------
+                    # Transfer raw to GPU via pinned memory (zero-copy DMA on CUDA).
+                    # np.clip on CPU replaced by torch.clamp on GPU — one less array pass.
+                    if self._raw_pinned is not None:
+                        self._raw_pinned.numpy()[:] = raw          # write into pinned RAM
+                        raw_t = self._raw_pinned.to(                # non-blocking DMA
+                            self._device, non_blocking=True)
+                    else:
+                        raw_t = torch.from_numpy(raw)              # CPU: zero-copy view
+
+                    # Canonical microcircuit bias applied once at init (CorticalLayers).
+                    # No global layer routing here — layers exist within columns, not as
+                    # global bands across the network (Douglas & Martin 1991).
+
+                    # Axonal delays: add PSPs that arrived this tick from past spikes
+                    delayed_psp = self._delay_queue.dequeue()
+                    # Schedule current activity into future slots (STP-scaled weights)
+                    brain_w_stp = self._plasticity.get_sparse_weights(apply_stp=True)
+                    # Rebuild edge-delay tensor if synaptogenesis/pruning changed topology
+                    n_edges = self._plasticity.indices.shape[1]
+                    if self._edge_delays.shape[0] != n_edges:
+                        self._edge_delays = build_delay_tensor(
+                            self._plasticity.indices[0],
+                            self._plasticity.indices[1],
+                            self._geometry.coordinates,
+                            device=self._device,
+                        )
+                    self._delay_queue.enqueue(
+                        self._activity,
+                        self._plasticity.indices[0],
+                        self._plasticity.indices[1],
+                        brain_w_stp._values(),
+                        self._edge_delays,
+                    )
+                    # Step STP state for next tick
+                    self._plasticity.step_stp(self._activity)
+
+                    # Recurrent drive = delayed PSPs (biologically correct);
+                    # instantaneous sparse.mm kept as small direct-coupling leak (0.05×)
+                    # because axonal delays are capped at 20 ticks — very long-range
+                    # connections beyond that still need some path.
+                    brain_w   = self._plasticity.get_sparse_weights()
+                    recurrent = delayed_psp + torch.sparse.mm(
+                        brain_w, self._activity.unsqueeze(1)).squeeze(1) * 0.05
+                    # clamp on GPU — no CPU round-trip for clip
+                    combined  = torch.clamp(raw_t + recurrent * 0.1, 0.0, 1.0)
+
+                    surprise_t, fep_state = self._predictor.process_inference_step(
+                        combined, self._activity, plasticity_rate=0.5)
+                    self.surprise  = float(surprise_t) if hasattr(surprise_t, '__float__') else surprise_t.item()
+                    self._activity = torch.clamp(
+                        self._time.create_conscious_now(combined, fep_state), 0.0, 1.0)
+
+                    # Refractory period + spike-frequency adaptation (Hodgkin & Huxley 1952)
+                    self._activity = self._plasticity.apply_neural_dynamics(self._activity)
+
+                    # Cortical lateral inhibition — GABAergic basket cells (Buzsáki 2004)
+                    # Applied after refractory/adaptation, before thalamic gating.
+                    # ACh modulates competition width (Hasselmo & McGaughy 2004).
+                    self._activity = self._plasticity.apply_lateral_inhibition(
+                        self._activity,
+                        target_sparsity=0.05,
+                        acetylcholine=getattr(chem, 'acetylcholine', 0.5),
+                    )
+
+                    salient = self._thalamus.filter_attention(
+                        self._activity, chem.noradrenaline, chem.boredom)
+                    if salient.any():
+                        self._activity = self._workspace.broadcast_via_synchrony(
+                            salient, self._activity)
+                        if (self.surprise > 5.0 or p_sig > 0.2
+                                or np.sum(mic_audio) > 1.0):
+                            raw_salience   = chem.dopamine - p_sig
+                            gated_salience = raw_salience * chem.hippocampal_salience_gate
+                            self._hippocampus.encode_episode(
+                                self._activity.cpu().numpy(), gated_salience)
+
+                    act_cpu = self._activity.cpu().numpy()
+
+                    # Superior Colliculus — gaze driven by internal brain state.
+                    # SC integrates motion salience, surprise, threat, and neuromodulators.
+                    # No scripted rule: the agent looks where desire/interest/fear points.
+                    # IOR emerges from burst-neuron refractory, not from external code.
+                    if self._sc is not None and _sl_vision is not None:
+                        _vis    = act_cpu[_sl_vision]
+                        _motion = _vis[4::5]   # motion  channel (temporal change)
+                        _luma   = _vis[3::5]   # luma    channel (includes top-down)
+                        # 5-HT suppresses CeA→SC threat projection (Gross & Canteras 2012)
+                        _threat_sc = self._amygdala.threat_level * (1.0 - chem.serotonin * 0.5)
+                        _fx, _fy, _sacc = self._sc.update(
+                            visual_motion  = _motion,
+                            visual_luma    = _luma,
+                            surprise       = self.surprise,
+                            threat         = _threat_sc,
+                            dopamine       = chem.dopamine,
+                            noradrenaline  = chem.noradrenaline,
+                            acetylcholine  = chem.acetylcholine,
+                            goal_drive     = self._pfc.goal_persistence,
+                        )
+                        if hasattr(world, 'receive_gaze'):
+                            world.receive_gaze(_fx, _fy)
+
+                    # Cortical areas — update area-wise activity map (Zeki 1978)
+                    self._areas.update(act_cpu)
+
+                    # Entorhinal grid cells — semantic position drifts with the
+                    # current input token (Hafting 2005). Hippocampus DG/CA3/CA1
+                    # then performs pattern separation + completion (Marr 1971).
+                    _ento_input = act_cpu[:self._entorhinal.total_cells]
+                    self._entorhinal.advance(int(self._activity.argmax().item()))
+                    _grid = self._entorhinal.get_grid_activity()
+                    # Pattern-separated hippocampal encoding of the current state
+                    _hipp_out = self._hipp_subf.encode(
+                        np.concatenate([_grid, act_cpu[:self._hipp_subf.input_size - len(_grid)]])
+                            if len(_grid) < self._hipp_subf.input_size else _grid[:self._hipp_subf.input_size]
+                    )
+                    # Novelty (CA1 mismatch) → mesocortical DA boost (Lisman & Grace 2005)
+                    if self._chemistry is not None and _hipp_out['novelty'] > 0.7:
+                        self._chemistry.dopamine_mesocortical = float(np.clip(
+                            chem.dopamine_mesocortical + 0.01, 0.1, 1.0))
+                    # Store every ~50 ticks so CA3 builds an associative trace
+                    if self.tick % 50 == 0:
+                        self._hipp_subf.store({'tick': self.tick, 'mood': self.mood})
+
+                    # Olfactory bulb — direct-to-amygdala route (Buck & Axel 1991).
+                    # No real chemoreceptors here; we treat very low-frequency
+                    # auditory bins as a coarse "scent of valence" surrogate so
+                    # the pathway is exercised. Output adds to amygdala arousal.
+                    if _sl_audio is not None:
+                        _scent = act_cpu[_sl_audio][:self._olfactory.num_glomeruli]
+                        if _scent.size < self._olfactory.num_glomeruli:
+                            _scent = np.pad(_scent, (0, self._olfactory.num_glomeruli - _scent.size))
+                        self._olfactory.update(_scent * 0.3)
+
+                    # Visuospatial sketchpad — spatial working memory (Baddeley 1986)
+                    # retina_data from step 2 above — vision channel
+                    self._visuospatial.update(retina_data if _sl_vision else np.zeros(1))
+
+                    # DMN — self-referential / autobiographical replay (Raichle 2001)
+                    dmn_out = self._dmn.update(
+                        external_arousal=float(np.mean(act_cpu)),
+                        episodic_memory=self._hippocampus.episodic_memory,
+                        wellbeing=self.wellbeing,
+                    )
+                    self._is_daydreaming = dmn_out['activation'] > 0.4
+                    self._dmn_replay_prev = dmn_out['replay_pattern']
+
+                    # Theory of Mind — only relevant when there is a social agent
+                    if hasattr(world, 'human_pos'):
+                        self._tom.update(
+                            distance=world.get_distance_to_human(),
+                            human_interacted=human_interacted,
+                            threat_signal=self._amygdala.threat_level,
+                        )
+
+                    # Neural complexity (every 100 ticks)
+                    # LZ76 complexity + spectral radius via GPU power iteration.
+                    # Replaces scipy CSR build which spiked memory to 2+ GB.
+                    if self.tick % 100 == 0:
+                        _w_pi = self._plasticity.get_sparse_weights()
+                        _v_pi = self._activity.clone()
+                        _n_pi = _v_pi.norm()
+                        _spectral_r = 0.0
+                        if _n_pi > 1e-12:
+                            _v_pi = _v_pi / _n_pi
+                            for _ in range(15):
+                                _v_pi = torch.sparse.mm(
+                                    _w_pi, _v_pi.unsqueeze(1)).squeeze(1)
+                                _n_pi = _v_pi.norm()
+                                if _n_pi < 1e-12:
+                                    break
+                                _v_pi = _v_pi / _n_pi
+                            _spectral_r = float(
+                                torch.sparse.mm(_w_pi, _v_pi.unsqueeze(1)).squeeze(1).norm())
+                        qualia_shape = self._nc.calculate(act_cpu, spectral_radius=_spectral_r)
+                        # Spectral radius proxy → ignition bias (Beggs & Plenz 2003):
+                        # near-critical networks (ρ≈1) show maximal dynamic range.
+                        # High complexity → lower ignition threshold.
+                        sr = qualia_shape[1]   # spectral_radius_proxy
+                        self._workspace._ignition_bias = float(
+                            np.clip(0.25 - sr * 0.2, 0.05, 0.25))
+
+                    # ----------------------------------------------------------
+                    # 4. Motor output
+                    # ----------------------------------------------------------
+                    motor_signals = act_cpu[_sl_motor]
+                    # PAG freeze: vlPAG inhibits motor output during freeze
+                    if self._pag.is_immobile:
+                        motor_signals = motor_signals * 0.1
+                    if _sl_voc is not None:
+                        vocal_cords = act_cpu[_sl_voc]
+                        if np.sum(vocal_cords) > 3.0:
+                            world.receive_vocalization(vocal_cords.copy())
+                            world.add_sound(
+                                getattr(world, 'agent_pos', [0, 0]),
+                                vocal_cords.copy() * 0.5,
+                            )
+                            # Enqueue echo into phonological loop ring buffer.
+                            # Written at current slot; read 2 ticks later (above).
+                            # Amplitude 0.4× — echo is quieter than source.
+                            self._voc_echo_buf[self._voc_echo_idx][:] = vocal_cords
+                        else:
+                            world.receive_vocalization(np.zeros(_sz_voc))
+                            self._voc_echo_buf[self._voc_echo_idx][:] = 0.0
+                        self._voc_echo_idx = (self._voc_echo_idx + 1) % 3
+
+                    spasm_intensity = float(np.mean(motor_signals))
+
+                    motor_pot = self._basal_ganglia.map_to_action_potentials(motor_signals)
+
+                    # ACC conflict monitoring — before action selection
+                    # Computes conflict across competing action potentials
+                    _pot_exp = np.exp(motor_pot - motor_pot.max())
+                    _pot_prob = _pot_exp / (_pot_exp.sum() + 1e-9)
+                    acc_out = self._acc.update(
+                        action_probs=_pot_prob,
+                        chosen_action=self._free_will.decision_queue[-1]['action']
+                            if self._free_will.decision_queue else None,
+                        prediction_error=self.surprise,
+                        pain_signal=self._amygdala.threat_level,
+                    )
+                    # High conflict → STN hyperdirect brake (Aron & Poldrack 2006)
+                    if acc_out['conflict'] > 0.7:
+                        self._basal_ganglia.hyperdirect_brake(acc_out['conflict'])
+                    # ACC control request → boost PFC goal persistence
+                    if acc_out['control_request'] > 0.5:
+                        self._pfc.goal_persistence = min(
+                            1.0, self._pfc.goal_persistence + 0.05)
+
+                    # Cerebellum — only meaningful with real proprioceptive reafference
+                    if hasattr(world, 'get_proprioception'):
+                        cereb_out = self._cerebellum.update(
+                            motor_command=motor_signals,
+                            actual_reafference=world.get_proprioception(),
+                        )
+                        if cereb_out['prediction_error'] > 0.1:
+                            _corr = cereb_out['correction']
+                            motor_pot = motor_pot + np.dot(_corr, self._basal_ganglia.direct_weights)
+
+                    self._free_will.unconscious_decision_making(
+                        motor_pot, chem.noradrenaline)
+                    final_action = self._free_will.conscious_veto_and_awareness()
+
+                    # ----------------------------------------------------------
+                    # 5. World interaction
+                    # ----------------------------------------------------------
+                    results = {'energy': 0.0, 'water': 0.0, 'stress': 0.0}
+                    # If world can receive raw motor pattern (e.g. TextWorld),
+                    # pass it before execute_action so it can decode via
+                    # nearest-neighbour pattern matching rather than BG action index.
+                    if hasattr(world, 'receive_motor_pattern'):
+                        world.receive_motor_pattern(motor_signals)
+
+                    num_actions = self._basal_ganglia.num_actions
+                    if (final_action is not None
+                            and final_action < num_actions
+                            and not self._is_daydreaming):
+                        results = world.execute_action(final_action)
+                        energy_gained = results.get('energy', 0.0)
+                        stress        = results.get('stress',  0.0)
+                        if energy_gained > 0 or results.get('water', 0.0) > 0:
+                            chem.trigger_endorphin_rush()
+                        # Somatic marker uses felt_distress (substance-P-sensitised
+                        # interoceptive signal) not raw world stress — this is the
+                        # "somatic" part: what the body felt, not what happened (Damasio 1996)
+                        felt_distress = max(p_sig, min(1.0, stress / 100.0))
+                        if felt_distress > 0.2:
+                            self._free_will.update_somatic_markers(
+                                final_action, felt_distress)
+                        # Habenula: anti-reward signal on omitted reward
+                        # (Matsumoto & Hikosaka 2007). Reward proxy = energy gain.
+                        anti_reward = self._habenula.update(
+                            actual_reward=energy_gained)
+                        if anti_reward > 0.1 and self._chemistry is not None:
+                            # LHb → RMTg → VTA: suppress mesolimbic DA
+                            self._chemistry.dopamine = float(np.clip(
+                                chem.dopamine - anti_reward * 0.05, 0.05, 1.0))
+                        # BasalGanglia: three-factor Hebbian — pain acts through DA
+                        self._basal_ganglia.reinforce_learning(
+                            final_action,
+                            dopamine=chem.dopamine,
+                        )
+
+                    # PAG defensive mode (fight/flight/freeze) — read by motor
+                    # gate during this and next ticks (Bandler & Shipley 1994)
+                    self._pag.update(
+                        threat=self._amygdala.threat_level,
+                        distance_to_threat=world.get_distance_to_human(),
+                        dopamine=chem.dopamine,
+                    )
+                    # vlPAG opioid analgesia during freeze
+                    if self._pag.opioid_analgesia > 0 and self._chemistry is not None:
+                        self._chemistry.endorphins = max(
+                            chem.endorphins, self._pag.opioid_analgesia)
+
+                    # ----------------------------------------------------------
+                    # 6. Neuromodulation (optional — skipped if no EndocrineSystem)
+                    # ----------------------------------------------------------
+                    if self._chemistry is not None:
+                        self._chemistry.update_state(
+                            global_arousal=float(np.mean(act_cpu)),
+                            layer23_error_spikes=self.surprise,
+                            raw_pain_signal=raw_pain_for_chem,
+                            energy_ratio=h_ratio,
+                            water_ratio=w_ratio,
+                            auditory_spikes=mic_audio,
+                            energy_gained=max(0.0, results.get('energy', 0.0)),
+                            isolation_ticks=getattr(world, 'isolation_ticks', 0),
+                            distance_to_human=world.get_distance_to_human(),
+                        )
+                        self.mood = chem.derive_mood()
+                        # Mood → plasticity modulation (Castrén 2005; Bhagya 2017)
+                        if self.mood == 'depression':
+                            chem.noradrenaline = max(0.0, chem.noradrenaline - 0.05)
+                            chem.acetylcholine = max(0.05, chem.acetylcholine * 0.97)
+                        elif self.mood == 'anxiety':
+                            chem.noradrenaline = min(1.0, chem.noradrenaline + 0.05)
+                        if hasattr(self._plasticity, 'apply_cortisol_damage'):
+                            self._plasticity.apply_cortisol_damage(chem.cortisol)
+
+                    self._ego.evaluate_self(self.wellbeing, raw_pain_for_chem)
+
+                    # Passive somatic marker decay every tick (Milad 2006)
+                    self._free_will.decay_markers_passive()
+
+                    # ----------------------------------------------------------
+                    # 7. Death check
+                    # ----------------------------------------------------------
+                    if not world.is_alive():
+                        print('\n>>> СМЕРТЬ ОРГАНИЗМА.')
+                        self._delete_save(sp_path)
+                        break
+
+                    # ----------------------------------------------------------
+                    # 8. Plasticity & learning
+                    # ----------------------------------------------------------
+                    pain_suppression = max(0.0, 1.0 - raw_pain_for_chem)
+                    # Mood gate: depression suppresses LTP rate (Castrén 2005)
+                    mood_ltp_gate = 0.5 if self.mood == 'depression' else 1.0
+                    plasticity_rate  = (chem.get_plasticity_multiplier()
+                                        * pain_suppression * mood_ltp_gate)
+                    self._plasticity.apply_stdp_learning(
+                        self._activity, plasticity_rate,
+                        acetylcholine=getattr(chem, 'acetylcholine', 0.5))
+
+                    # Mirror neuron STDP gate — three-factor amplification:
+                    #   1. mirror_neuron_amplifier: oxytocin + NA inverted-U + insula/amygdala
+                    #      emotional context (substance_p × (1 − anandamide))
+                    #   2. _bio_motion_score: MT+/V5 gate — only amplify when visual input
+                    #      looks like biological motion (not static background or camera pan)
+                    #   3. Motor activity: mirror neurons only re-fire if motor cortex
+                    #      is simultaneously active (Rizzolatti 1996 — observation alone
+                    #      is insufficient; the motor program must be primed)
+                    # When all three are present: extra STDP pass on mirror_neurons slice
+                    # with boosted rate — strengthens V→M path (Iacoboni 1999).
+                    if (layout.has('mirror_neurons')
+                            and _bio_motion_score > 0.2
+                            and chem.mirror_neuron_amplifier > 0.7):
+                        _sl_mirror = layout.slice('mirror_neurons')
+                        _sl_motor_loc = _sl_motor  # motor activity = motor priming
+                        motor_active = float(self._activity[_sl_motor_loc].mean().item()) > 0.1
+                        if motor_active:
+                            # Isolate mirror zone activity and run an extra STDP pass
+                            # with amplified rate — purely Hebbian, no reward signal
+                            mirror_rate = (plasticity_rate
+                                           * chem.mirror_neuron_amplifier
+                                           * _bio_motion_score)
+                            mirror_activity = self._activity.clone()
+                            # Zero out everything outside mirror zone so STDP only
+                            # updates synapses involving these neurons
+                            mask = torch.zeros(self.num_neurons,
+                                               dtype=torch.bool, device=self._device)
+                            mask[_sl_mirror] = True
+                            mirror_activity[~mask] = 0.0
+                            self._plasticity.apply_stdp_learning(
+                                mirror_activity, mirror_rate,
+                                acetylcholine=getattr(chem, 'acetylcholine', 0.5))
+
+                    # Astrocytes: slow weight-stability layer (Fusi 2005 cascade)
+                    # Pulls inactive synapses toward their slow EMA — preserves
+                    # long-term memory without blocking fast STDP (Volterra 2005)
+                    self._plasticity.weights_values = self._astrocytes.step(
+                        self._plasticity.weights_values,
+                        self._plasticity.indices[0],
+                        self._plasticity.indices[1],
+                        self._activity,
+                    )
+
+                    self._plasticity.synaptogenesis_and_pruning(
+                        self._activity, self.wellbeing * 3000)
+                    if self.tick % 100 == 0:
+                        self._plasticity.maintain_homeostasis()
+
+                    # Neurogenesis — triggered by surprise (Eriksson 1998; Bhagya 2011)
+                    # High prediction error → epistemic hunger → hippocampal neurogenesis
+                    self._plasticity.trigger_neurogenesis(self.surprise)
+
+                    # PFC self-monitoring accumulation — lucid dream substrate
+                    # (Stumbrys 2012; Erlacher 2008)
+                    # Grows when: surprise is high (reality feels anomalous) AND
+                    # PFC goal vector is active (metacognitive engagement).
+                    # Any waking habit that combines these two will strengthen it —
+                    # the brain can discover its own "techniques" through STDP.
+                    pfc_active   = float(self._pfc.goal_persistence) > 0.3
+                    high_surprise = self.surprise > 3.0
+                    if pfc_active and high_surprise:
+                        self._pfc_monitoring_strength = min(
+                            1.0, self._pfc_monitoring_strength + 0.0002)
+                    # Slow decay τ ≈ 5000 ticks
+                    self._pfc_monitoring_strength *= 0.9998
+
+                    # Sleep trigger
+                    self._clock.update_clock(
+                        energy_spent=(1.0 + spasm_intensity * 5.0) * self._clock_energy_scale)
+                    if not self._clock.is_awake and not self._sleep.is_sleeping:
+                        self._sleep.is_sleeping = True
+                        self._sleep.begin_sleep(self._hippocampus)
+
+                # === RENDER ==================================================
+                if ui is not None and self.tick % 2 == 0:
+                    feels_dict = self._feelings.as_dict() if self._feelings else {}
+                    stats = {
+                        'tick':        self.tick,
+                        'wellbeing':   self.wellbeing,
+                        'feels':       feels_dict,
+                        'nodes':       self._plasticity.active_limit,
+                        'vfe':         self.surprise,
+                        'mood':        ('ГРЁЗЫ (DMN)'
+                                        if getattr(self, '_is_daydreaming', False)
+                                        else self.mood)
+                                       if not self._sleep.is_sleeping else self.mood,
+                        'phi':         self._workspace.calculate_integration_metric(self._activity),
+                        'speed_name':  speed_names[speed_idx],
+                        'qualia':      qualia_shape,
+                        'agency':      self._ego.sense_of_agency,
+                        # Hormones (0.0 if no EndocrineSystem attached)
+                        'cortisol':      getattr(chem, 'cortisol',      0.0),
+                        'oxytocin':      getattr(chem, 'oxytocin',      0.0),
+                        'adrenaline':    getattr(chem, 'adrenaline',    0.0),
+                        'endorphins':    getattr(chem, 'endorphins',    0.0),
+                        'boredom':       getattr(chem, 'boredom',       0.0),
+                        'acetylcholine': getattr(chem, 'acetylcholine', 0.5),
+                        'anandamide':    getattr(chem, 'anandamide',    0.0),
+                        'substance_p':   getattr(chem, 'substance_p',   0.0),
+                        'ghrelin':       getattr(chem, 'ghrelin',       0.0),
+                        'leptin':        getattr(chem, 'leptin',        0.5),
+                        'vasopressin':   getattr(chem, 'vasopressin',   0.0),
+                        'prolactin':     getattr(chem, 'prolactin',     0.0),
+                        'insulin':       getattr(chem, 'insulin',       0.0),
+                    }
+                    ui.render(world, stats)
+
+                if ui is not None and speeds[speed_idx] > 0.0:
+                    time.sleep(speeds[speed_idx])
+
+        except KeyboardInterrupt:
+            print('\n>>> Экстренное прерывание.')
+        finally:
+            if not headless:
+                import pygame
+                pygame.quit()
+            if ear is not None and hasattr(ear, 'stream') and ear.stream is not None:
+                ear.stream.stop()
+            if world.is_alive():
+                self.save(sp_path)
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _delete_save(self, path: str) -> None:
+        """Delete brain save (called on death — world save is not deleted)."""
+        if self._is_legacy_path(path):
+            if os.path.exists(path):
+                os.remove(path)
+        else:
+            d = Path(path)
+            for name in ('brain.json', 'weights.npz'):
+                f = d / name
+                if f.exists():
+                    f.unlink()

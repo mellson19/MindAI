@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mindai"
+version = "0.1.0"
+description = "Biologically-inspired artificial mind — Hebbian/STDP learning, no gradient descent"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyyaml>=6.0",
+    "pygame>=2.4",
+]
+
+[project.scripts]
+mindai = "main:main"
+
+[tool.setuptools.packages.find]
+include = ["mindai", "mindai.*"]
+
+[tool.setuptools.package-data]
+mindai = ["../config/*.yaml"]

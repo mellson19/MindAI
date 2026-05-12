@@ -1,0 +1,483 @@
+"""StructuralPlasticity — Hebbian/STDP learning with biological accuracy.
+
+STDP asymmetry (Bi & Poo 1998):
+  Causal   (pre→post, LTP): τ+ ≈ 20 ms,  A+ = 0.05   (faster trace, larger)
+  Anti-causal (post→pre, LTD): τ- ≈ 40 ms,  A- = 0.015  (slower trace, smaller)
+  Implemented via different decay rates: pre_trace *= 0.90, post_trace *= 0.85
+
+Sign convention:
+  Inhibitory pre-synaptic neurons carry negative weights.  STDP strengthens
+  them in the negative direction (more inhibitory) and weakens in the positive
+  direction — consistent with the receptor type at the post-synaptic membrane.
+  LTP on an inhibitory synapse → weight more negative → correct biology.
+  LTD on an inhibitory synapse → weight less negative → correct biology.
+
+Homeostatic synaptic scaling (Turrigiano 1998):
+  Target incoming weight sum scales with network density so it stays valid
+  across any num_neurons / density combination.
+
+Critical-period plasticity (Hubel & Wiesel 1970; Hensch 2005):
+  Heightened plasticity early in life, gradually closing as the brain ages.
+  Implemented via `critical_period_factor`: STDP rate is multiplied by
+  this factor, which decays from ~3.0 toward 1.0 over the first ~50k ticks
+  (≈ infant-to-adolescent maturation curve at 10 Hz). Older brains can
+  still learn but at adult rate.
+"""
+
+import torch
+import numpy as np
+import random
+
+
+class StructuralPlasticity:
+
+    def __init__(
+        self,
+        num_nodes:        int,
+        initial_density:  float = 0.01,
+        inhibitory_ratio: float = 0.2,
+    ):
+        self.device           = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_nodes        = num_nodes
+        # Neonatal cortex: ~20% of neurons active at birth, matures to ~80% max.
+        # Neurogenesis (trigger_neurogenesis) gradually unlocks the rest.
+        # Huttenlocher 1979: synaptic density peaks ~2 years then prunes to adult level.
+        self.active_limit     = max(int(num_nodes * 0.20), 1000)
+        self._active_ceiling  = int(num_nodes * 0.80)   # adult maximum
+        self.epistemic_hunger = 0.0
+        self.hunger_threshold = 100.0
+        self.growth_cooldown  = 0
+        self._initial_density = initial_density
+
+        # Homeostatic target: mean incoming weight sum per neuron.
+        # At density d, each neuron has ~d*N inputs; target keeps mean weight ~0.5.
+        # Scales proportionally so it stays valid across network sizes.
+        self._homeostatic_target = max(2.0, initial_density * self.active_limit * 0.5)
+
+        print(f'    [БИОЛОГИЯ] Выращивание графа на {self.device}. '
+              f'80% Глутамат / 20% ГАМК...')
+
+        self.is_inhibitory_tensor = torch.rand(num_nodes, device=self.device) < inhibitory_ratio
+        self.is_inhibitory        = self.is_inhibitory_tensor.cpu().numpy()
+
+        num_connections = int(self.active_limit * self.active_limit * initial_density)
+        indices = torch.randint(0, self.active_limit, (2, num_connections), device=self.device)
+        mask    = indices[0] != indices[1]
+        self.indices = indices[:, mask]
+
+        signs = torch.where(self.is_inhibitory_tensor[self.indices[0]], -1.0, 1.0)
+        self.weights_values   = (torch.rand(self.indices.shape[1], device=self.device) * 0.09 + 0.01) * signs
+        self.integrity_values = torch.ones(self.indices.shape[1], device=self.device)
+
+        # STDP traces — DIFFERENT decay rates to implement temporal asymmetry
+        # pre_trace  (for LTP): τ+ ≈ 20 ms → decay 0.85 at 10 Hz (narrower causal window)
+        # post_trace (for LTD): τ- ≈ 40 ms → decay 0.90 at 10 Hz (wider anti-causal window)
+        # Bi & Poo 1998: τ- > τ+ — LTD window must be wider than LTP window.
+        self.pre_trace  = torch.zeros(num_nodes, device=self.device)
+        self.post_trace = torch.zeros(num_nodes, device=self.device)
+
+        # Refractory period — Na⁺ channel inactivation (Hodgkin & Huxley 1952)
+        # After a spike the neuron cannot fire for ~2 ms (absolute refractory).
+        # Stored as a countdown tensor: >0 means in refractory, decremented each tick.
+        # 2 ticks at 10 Hz ≈ 2 ms biological.
+        self._refractory = torch.zeros(num_nodes, dtype=torch.int16, device=self.device)
+        self._REFRACTORY_TICKS = 2
+
+        # Spike-frequency adaptation — slow K⁺ channel activation (Bhattacharjee 2005)
+        # Prolonged firing opens K+ (KCa, Kv7) channels → hyperpolarisation → lower
+        # effective excitability. Modelled as an adaptation current that accumulates
+        # when the neuron fires and decays when it is silent (τ ≈ 100 ms → 0.90/tick).
+        self._adaptation = torch.zeros(num_nodes, device=self.device)
+
+        # Short-term synaptic plasticity — Tsodyks & Markram 1997
+        # u: utilization (facilitation variable, increases with each spike)
+        # x: available vesicle fraction (depression variable, decreases with use)
+        # Parameters: τ_rec = 800 ms (0.988/tick), τ_fac = 500 ms (0.982/tick)
+        # Facilitating synapses (inh→exc) vs depressing synapses (exc→exc) differ
+        # in U₀: here uniform U₀=0.3 for simplicity (Zucker & Regehr 2002).
+        n_syn = self.indices.shape[1]
+        self._stp_u = torch.full((n_syn,), 0.3, device=self.device)  # utilization
+        self._stp_x = torch.ones(n_syn,        device=self.device)  # vesicle fraction
+
+        self._cached_sparse_weights = None
+        self._topology_changed      = True
+
+        # Critical-period plasticity (Hensch 2005)
+        # Brain "age" in ticks; STDP rate multiplied by critical_period_factor
+        # which starts at 3.0 and decays toward 1.0 over ~50k ticks.
+        self._age_ticks: int = 0
+        self._cp_initial = 3.0
+        self._cp_tau     = 50_000.0    # ticks to ~e-fold decay
+
+    # ------------------------------------------------------------------
+    # Single-neuron dynamics — refractory + adaptation (applied before STDP)
+    # ------------------------------------------------------------------
+
+    def apply_neural_dynamics(self, activity: torch.Tensor) -> torch.Tensor:
+        """Enforce refractory period and spike-frequency adaptation.
+
+        Returns filtered activity where refractory neurons are silenced and
+        adapting neurons have reduced gain. Operates entirely on GPU.
+
+        Refractory: Hodgkin & Huxley 1952 — absolute refractory 2 ticks.
+        Adaptation:  Bhattacharjee & Bhattacharjee 2005 — slow K⁺ activation.
+        """
+        # --- Absolute refractory: silence any neuron still counting down ---
+        refractory_mask = self._refractory > 0
+        activity = activity * (~refractory_mask).float()
+
+        # --- Spike-frequency adaptation: reduce gain by accumulated K⁺ current ---
+        # Adaptation factor in [0.3, 1.0]: heavy firing → lower gain
+        adaptation_gain = torch.clamp(1.0 - self._adaptation * 0.7, 0.3, 1.0)
+        activity = activity * adaptation_gain
+
+        # --- Update refractory countdown ---
+        # Neurons that just fired enter refractory; others decrement toward 0
+        fired_now = activity > 0.5
+        self._refractory[fired_now]  = self._REFRACTORY_TICKS
+        self._refractory[~fired_now] = torch.clamp(
+            self._refractory[~fired_now] - 1, min=0).to(torch.int16)
+
+        # --- Update adaptation variable (τ ≈ 100 ms → decay 0.90/tick at 10 Hz) ---
+        self._adaptation *= 0.90
+        self._adaptation[fired_now] = torch.clamp(
+            self._adaptation[fired_now] + 0.15, 0.0, 1.0)
+
+        return activity
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _coalesce_state(self):
+        # Coalesce all per-edge state together so duplicates get merged consistently
+        combined = torch.stack([self.weights_values, self.integrity_values,
+                                self._stp_u, self._stp_x], dim=1)
+        temp = torch.sparse_coo_tensor(
+            self.indices, combined,
+            (self.num_nodes, self.num_nodes, 4)).coalesce()
+        self.indices          = temp.indices()
+        v                     = temp.values()
+        self.weights_values   = v[:, 0]
+        self.integrity_values = torch.clamp(v[:, 1], 0.0, 2.0)
+        self._stp_u           = torch.clamp(v[:, 2], 0.0, 1.0)
+        self._stp_x           = torch.clamp(v[:, 3], 0.0, 1.0)
+        self._cached_sparse_weights = torch.sparse_coo_tensor(
+            self.indices, self.weights_values, (self.num_nodes, self.num_nodes))
+        self._topology_changed = False
+
+    def get_sparse_weights(self, apply_stp: bool = False) -> torch.Tensor:
+        """Return cached sparse weight matrix, optionally scaled by STP efficacy.
+
+        apply_stp=True: weights multiplied by u*x (release probability × vesicles).
+        Called with apply_stp=True each tick from brain.py; False during sleep replay
+        where STP state should not be consumed.
+        """
+        if getattr(self, '_topology_changed', True) or self._cached_sparse_weights is None:
+            self._coalesce_state()
+        else:
+            self._cached_sparse_weights._values().copy_(self.weights_values)
+
+        if apply_stp:
+            stp_efficacy = self._stp_u * self._stp_x   # release probability × resource
+            eff_vals = self.weights_values * stp_efficacy
+            return torch.sparse_coo_tensor(
+                self.indices, eff_vals, (self.num_nodes, self.num_nodes))
+
+        return self._cached_sparse_weights
+
+    def step_stp(self, activity: torch.Tensor) -> None:
+        """Advance short-term synaptic plasticity state for one tick.
+
+        Tsodyks & Markram 1997:
+          u += U₀ × (1 − u)    when pre fires  (facilitation: Ca²⁺ → higher release P)
+          x -= u × x            when pre fires  (depression: vesicle depletion)
+          u recovers: τ_fac = 500 ms → 0.982/tick
+          x recovers: τ_rec = 800 ms → 0.988/tick
+        """
+        self._stp_u *= 0.982   # τ_fac recovery
+        self._stp_x *= 0.988   # τ_rec recovery — vesicle replenishment
+        self._stp_x = torch.clamp(self._stp_x, 0.0, 1.0)
+
+        pre_fired = activity[self.indices[0]] > 0.5
+        if pre_fired.any():
+            U0 = 0.3
+            # Facilitation: Ca²⁺ influx increases vesicle release probability
+            self._stp_u[pre_fired] = torch.clamp(
+                self._stp_u[pre_fired] + U0 * (1.0 - self._stp_u[pre_fired]), 0.0, 1.0)
+            # Depression: released vesicles temporarily depleted
+            self._stp_x[pre_fired] = torch.clamp(
+                self._stp_x[pre_fired] - self._stp_u[pre_fired] * self._stp_x[pre_fired],
+                0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Neurogenesis — van Praag 2002; Eriksson 1998
+    # ------------------------------------------------------------------
+
+    def _wire_new_neurons(self, old_limit: int, new_limit: int):
+        """Grow axons and dendrites for newly activated neurons.
+
+        New neurons form synapses with existing active neurons — both incoming
+        (dendritic growth, ~1-2 weeks in biology) and outgoing (axonal growth,
+        ~3-4 weeks). Initial weights are small (immature synapses, Bhatt 2009)
+        and integrity is low so pruning removes them quickly if unused.
+        """
+        new_count  = new_limit - old_limit
+        n_existing = old_limit
+        n_new_syn  = max(1, int(new_count * n_existing * self._initial_density * 2))
+
+        new_nrn  = torch.randint(old_limit,  new_limit,  (n_new_syn,), device=self.device)
+        existing = torch.randint(0,          n_existing, (n_new_syn,), device=self.device)
+
+        half = n_new_syn // 2
+        # Incoming: existing → new (dendrite receives input)
+        # Outgoing: new → existing (axon sends output)
+        src = torch.cat([existing[:half], new_nrn[half:]])
+        tgt = torch.cat([new_nrn[:half],  existing[half:]])
+        # No autapses — cortex has no self-connections
+        no_self = src != tgt
+        src, tgt = src[no_self], tgt[no_self]
+        n_new_syn = src.shape[0]
+
+        signs       = torch.where(self.is_inhibitory_tensor[src], -1.0, 1.0)
+        new_weights = torch.rand(n_new_syn, device=self.device) * 0.02 * signs
+        new_integ   = torch.full((n_new_syn,), 0.3, device=self.device)  # fragile
+
+        self.indices          = torch.cat([self.indices,          torch.stack([src, tgt])], dim=1)
+        self.weights_values   = torch.cat([self.weights_values,   new_weights])
+        self.integrity_values = torch.cat([self.integrity_values, new_integ])
+        self._stp_u           = torch.cat([self._stp_u, torch.full((n_new_syn,), 0.3, device=self.device)])
+        self._stp_x           = torch.cat([self._stp_x, torch.ones(n_new_syn,        device=self.device)])
+        self._topology_changed = True
+
+    def trigger_neurogenesis(self, surprise_level: float):
+        if self.growth_cooldown > 0:
+            self.growth_cooldown -= 1
+            return
+        self.epistemic_hunger += surprise_level
+        if self.epistemic_hunger > self.hunger_threshold and self.active_limit < self._active_ceiling:
+            old_limit          = self.active_limit
+            self.active_limit  = min(self.active_limit + 5, self._active_ceiling)
+            self.epistemic_hunger = 0.0
+            self.growth_cooldown  = 300
+            self._wire_new_neurons(old_limit, self.active_limit)
+
+    # ------------------------------------------------------------------
+    # STDP — biologically asymmetric (Bi & Poo 1998)
+    # ------------------------------------------------------------------
+
+    @property
+    def critical_period_factor(self) -> float:
+        """STDP rate multiplier from current brain age (Hensch 2005)."""
+        import math
+        return 1.0 + (self._cp_initial - 1.0) * math.exp(-self._age_ticks / self._cp_tau)
+
+    def apply_stdp_learning(
+        self,
+        current_activity:          torch.Tensor,
+        neuromodulator_multiplier: float,
+        acetylcholine:             float = 0.5,
+    ):
+        # Critical-period scaling — younger brain learns faster (Hensch 2005)
+        self._age_ticks += 1
+        cp_scale = self.critical_period_factor
+        neuromodulator_multiplier = neuromodulator_multiplier * cp_scale
+
+        # Asymmetric trace decay: pre decays faster (narrower LTP window),
+        # post decays slower (wider LTD window) — Bi & Poo 1998: τ- > τ+.
+        self.pre_trace  *= 0.85   # T½ ≈ 4.3 ticks → τ+ ≈ 20 ms proxy
+        self.post_trace *= 0.90   # T½ ≈ 6.6 ticks → τ- ≈ 40 ms proxy
+
+        active_now_mask = current_activity > 0.5
+
+        if not active_now_mask.any():
+            # Still update traces even if nothing fires this tick
+            return
+
+        pre_idx  = self.indices[0]
+        post_idx = self.indices[1]
+
+        # Sign: inhibitory pre → negative direction for LTP and LTD
+        signs = torch.where(self.is_inhibitory_tensor[pre_idx], -1.0, 1.0)
+
+        # LTP/LTD use traces from BEFORE this tick's spikes are registered.
+        # Traces reflect neurons that fired in PREVIOUS ticks only — correct
+        # temporal ordering: pre must precede post (Bi & Poo 1998).
+
+        # LTP: causal (pre fired before post fires now)
+        # Magnitude A+ = 0.05, scales with pre trace (how recently pre fired)
+        ltp_mask = (self.pre_trace[pre_idx] > 0.1) & active_now_mask[post_idx]
+        if ltp_mask.any():
+            # Scale by postsynaptic activity magnitude (calcium influx proxy)
+            # ACh broadens STDP window — higher ACh → more LTP (Hasselmo 2003)
+            post_act_mag = current_activity[post_idx][ltp_mask]
+            ach_boost = 1.0 + acetylcholine * 0.3
+            delta_ltp = (0.05
+                         * self.pre_trace[pre_idx][ltp_mask]
+                         * post_act_mag
+                         * neuromodulator_multiplier
+                         * ach_boost)
+            self.weights_values[ltp_mask] = torch.clamp(
+                self.weights_values[ltp_mask] + delta_ltp * signs[ltp_mask],
+                -1.0, 1.0)
+            self.integrity_values[ltp_mask] = torch.clamp(
+                self.integrity_values[ltp_mask] + 0.1, 0.0, 2.0)
+
+        # LTD: anti-causal (post fired before pre fires now)
+        # Magnitude A- = 0.015  (< A+, asymmetry from Bi & Poo 1998)
+        ltd_mask = active_now_mask[pre_idx] & (self.post_trace[post_idx] > 0.1)
+        if ltd_mask.any():
+            delta_ltd = (0.015
+                         * self.post_trace[post_idx][ltd_mask]
+                         * neuromodulator_multiplier)
+            self.weights_values[ltd_mask] = torch.clamp(
+                self.weights_values[ltd_mask] - delta_ltd * signs[ltd_mask],
+                -1.0, 1.0)
+
+        # NOW register spikes into traces — after LTP/LTD, so this tick's
+        # activity only influences plasticity from the NEXT tick onward.
+        self.pre_trace[active_now_mask]  = 1.0
+        self.post_trace[active_now_mask] = 1.0
+
+    # ------------------------------------------------------------------
+    # Cortical lateral inhibition — GABAergic basket cells (Buzsáki 2004)
+    # ------------------------------------------------------------------
+
+    def apply_lateral_inhibition(
+        self,
+        activity:      torch.Tensor,
+        target_sparsity: float = 0.05,
+        acetylcholine:   float = 0.5,
+    ) -> torch.Tensor:
+        """k-Winners-Take-All via fast GABAergic interneurons.
+
+        Basket cells (PV+) provide perisomatic inhibition to all non-winners
+        within a cortical column within ~5 ms — effectively instantaneous at
+        our tick resolution (Freund & Katona 2007).
+
+        Acetylcholine modulates sparsity: high ACh (attention/novelty) → broader
+        activation (more winners); low ACh (rest) → tighter competition
+        (Hasselmo & McGaughy 2004).
+
+        k is computed on GPU via torch.topk — O(n log k), no CPU round-trip.
+        Excitatory winners keep their activation; inhibited neurons are clamped
+        to zero (not just suppressed) to model hyperpolarisation by GABA-A.
+        Inhibitory neurons (GABA) are exempt — they fire freely.
+        """
+        n = activity.shape[0]
+        # ACh broadens the active pool: sparsity shrinks at high ACh
+        effective_sparsity = target_sparsity * (1.0 - acetylcholine * 0.4)
+        k = max(1, int(n * effective_sparsity))
+
+        # Inhibitory neurons always pass through (they ARE the inhibition)
+        excitatory_mask = ~self.is_inhibitory_tensor[:n]
+        exc_activity    = activity * excitatory_mask.float()
+
+        # topk on GPU — no sort of full array, O(n log k)
+        threshold_val = torch.topk(exc_activity, k, sorted=False).values.min()
+
+        # Winners: top-k excitatory + all inhibitory
+        winner_mask = (exc_activity >= threshold_val) | self.is_inhibitory_tensor[:n]
+        return activity * winner_mask.float()
+
+    # ------------------------------------------------------------------
+    # Structural plasticity
+    # ------------------------------------------------------------------
+
+    def synaptogenesis_and_pruning(self, active_nodes: torch.Tensor, energy_level: float):
+        # Pruning: drop dead synapses (integrity == 0) — must keep STP in sync
+        if random.random() < 0.1:
+            alive_mask = self.integrity_values > 0.0
+            if not alive_mask.all():
+                self.indices          = self.indices[:, alive_mask]
+                self.weights_values   = self.weights_values[alive_mask]
+                self.integrity_values = self.integrity_values[alive_mask]
+                self._stp_u           = self._stp_u[alive_mask]
+                self._stp_x           = self._stp_x[alive_mask]
+                self._topology_changed = True
+
+        # Growth: spawn new synapses between co-active neurons
+        if energy_level > 1000.0 and random.random() < 0.05:
+            active_idx = torch.where(active_nodes[:self.active_limit] > 0.5)[0]
+            if len(active_idx) > 1:
+                n_new = 20
+                src = active_idx[torch.randint(0, len(active_idx), (n_new,), device=self.device)]
+                tgt = active_idx[torch.randint(0, len(active_idx), (n_new,), device=self.device)]
+                no_self = src != tgt
+                src, tgt = src[no_self], tgt[no_self]
+                if src.shape[0] > 0:
+                    k = src.shape[0]
+                    signs         = torch.where(self.is_inhibitory_tensor[src], -1.0, 1.0)
+                    self.indices          = torch.cat([self.indices, torch.stack([src, tgt])], dim=1)
+                    self.weights_values   = torch.cat([self.weights_values,
+                                                       torch.rand(k, device=self.device) * 0.1 * signs])
+                    self.integrity_values = torch.cat([self.integrity_values,
+                                                       torch.ones(k, device=self.device) * 0.5])
+                    self._stp_u           = torch.cat([self._stp_u,
+                                                       torch.full((k,), 0.3, device=self.device)])
+                    self._stp_x           = torch.cat([self._stp_x,
+                                                       torch.ones(k, device=self.device)])
+                    self._topology_changed = True
+
+    # ------------------------------------------------------------------
+    # Synaptic homeostasis (Turrigiano 1998)
+    # ------------------------------------------------------------------
+
+    def maintain_homeostasis(self):
+        """Normalise incoming weight sums to prevent runaway excitation/silence.
+
+        Uses scatter_add on edge indices instead of sparse.sum().to_dense() —
+        O(edges) with no full-matrix materialisation (Turrigiano 1998).
+        """
+        post_idx = self.indices[1]
+        # Sum |w| per post-synaptic neuron via scatter — touches only existing edges
+        incoming_sum = torch.zeros(self.num_nodes, device=self.device)
+        incoming_sum.scatter_add_(0, post_idx, self.weights_values.abs())
+        target = self._homeostatic_target
+
+        overloaded  = incoming_sum > target
+        underloaded = (incoming_sum > 0) & (incoming_sum < target * 0.1)
+
+        scale_factors = torch.ones(self.num_nodes, device=self.device)
+        if overloaded.any():
+            scale_factors[overloaded] = target / incoming_sum[overloaded]
+        if underloaded.any():
+            scale_factors[underloaded] = torch.clamp(
+                (target * 0.5) / incoming_sum[underloaded], 1.0, 2.0)
+
+        self.weights_values *= scale_factors[post_idx]
+
+    # ------------------------------------------------------------------
+    # Cortisol-mediated glutamate excitotoxicity (Cerqueira 2007)
+    # ------------------------------------------------------------------
+
+    def apply_cortisol_damage(self, cortisol_level: float):
+        """Chronic cortisol → dendritic atrophy in prefrontal and hippocampal neurons.
+
+        Mechanism: sustained HPA activation → glutamate excitotoxicity →
+        Ca²⁺ overload → dendritic spine retraction (McEwen 2007).
+        Selects most active post-synaptic neurons (highest activation =
+        highest Ca²⁺ load) rather than random victim.
+        """
+        if cortisol_level <= 0.5 or random.random() >= 0.1:
+            return
+        damage_chance = (cortisol_level - 0.5) * 0.05
+        if random.random() >= damage_chance:
+            return
+
+        # Pick a vulnerable neuron (most active incoming weights = most Ca²⁺)
+        incoming_sum = torch.zeros(self.num_nodes, device=self.device)
+        incoming_sum.scatter_add_(0, self.indices[1], self.weights_values.abs())
+        # Avoid zeros (unconnected neurons)
+        candidates   = torch.where(incoming_sum > 0)[0]
+        if len(candidates) == 0:
+            return
+        victim = int(candidates[torch.argmax(incoming_sum[candidates])])
+
+        victim_mask = self.indices[1] == victim   # afferents onto victim
+        if victim_mask.any():
+            self.weights_values[victim_mask]   *= 0.8
+            self.integrity_values[victim_mask]  = torch.clamp(
+                self.integrity_values[victim_mask] - 0.2, min=0.0)
+            print(f'    [ПСИХИАТРИЯ] Глутаматная эксайтотоксичность! '
+                  f'Кортизол повредил дендриты нейрона {victim}.')

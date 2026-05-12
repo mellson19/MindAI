@@ -1,0 +1,6 @@
+"""python -m webgui — entry point."""
+
+from webgui.server import main
+
+if __name__ == '__main__':
+    main()

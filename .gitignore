@@ -184,4 +184,11 @@ CLAUDE.md
 .my_saves
 savegame.pkl
 My_ideas.md
-.data
+data
+minecraft_mod
+tools
+main_minecraft.py
+ROADMAP.md
+chats
+models
+mindai.egg-info
